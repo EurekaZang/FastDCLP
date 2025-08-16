@@ -14,10 +14,12 @@ class IsaacLabEnv:
         num_envs: int,
         seed: int,
         action_bounds: Optional[float] = None,
+        render_mode: Optional[str] = None,
+        headless: bool = True,
     ):
         from isaaclab.app import AppLauncher
 
-        app_launcher = AppLauncher(headless=True, device=device)
+        app_launcher = AppLauncher(headless=headless, device=device)
         simulation_app = app_launcher.app
 
         import isaaclab_tasks
@@ -30,7 +32,8 @@ class IsaacLabEnv:
         )
         env_cfg.seed = seed
         self.seed = seed
-        self.envs = gym.make(task_name, cfg=env_cfg, render_mode=None)
+        self.render_mode = render_mode
+        self.envs = gym.make(task_name, cfg=env_cfg, render_mode=render_mode)
 
         self.num_envs = self.envs.unwrapped.num_envs
         self.max_episode_steps = self.envs.unwrapped.max_episode_length
@@ -64,7 +67,7 @@ class IsaacLabEnv:
         if self.action_bounds is not None:
             actions = torch.clamp(actions, -1.0, 1.0) * self.action_bounds
         obs_dict, rew, terminations, truncations, infos = self.envs.step(actions)
-        print(f"\n\n\n------------------\nobservation dict: {obs_dict}------------------")
+        # Debug print removed for cleaner output
         dones = (terminations | truncations).to(dtype=torch.long)
         obs = obs_dict["policy"]
         critic_obs = obs_dict["critic"] if self.asymmetric_obs else None
@@ -79,6 +82,13 @@ class IsaacLabEnv:
         return obs, rew, dones, info_ret
 
     def render(self):
-        raise NotImplementedError(
-            "We don't support rendering for IsaacLab environments"
-        )
+        """Render the environment. Returns RGB array if render_mode is 'rgb_array'."""
+        if self.render_mode == "rgb_array":
+            return self.envs.render()
+        elif self.render_mode == "human":
+            self.envs.render()
+            return None
+        else:
+            raise NotImplementedError(
+                f"Render mode '{self.render_mode}' not supported. Use 'rgb_array' or 'human'."
+            )
