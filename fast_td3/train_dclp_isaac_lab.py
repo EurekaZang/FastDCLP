@@ -81,7 +81,7 @@ class DCLPArgs:
     """Target network soft update rate"""
     batch_size: int = 4096
     """Training batch size"""
-    buffer_size: int = 1000000
+    buffer_size: int = 1024 * 5
     """Replay buffer size"""
     
     # Learning rates
@@ -129,7 +129,7 @@ class DCLPArgs:
     # Optimization
     amp: bool = True
     """Use automatic mixed precision"""
-    amp_dtype: str = "bf16"
+    amp_dtype: str = "fp16"
     """AMP dtype (bf16 or fp16)"""
     compile: bool = True
     """Compile model with torch.compile"""
@@ -264,40 +264,22 @@ def main():
         "device": device,
     }
     
-    print("Creating DCLP Actor and Critic networks...")
-    actor = Actor(**actor_kwargs)
-    critic = Critic(**critic_kwargs)
-    critic_target = Critic(**critic_kwargs)
-    
-    # Initialize target network
-    critic_target.load_state_dict(critic.state_dict())
-    
-    print("Actor initialized successfully")
-    print("Critic and target critic initialized successfully")
-    
-    # Setup optimizers
-    actor_optimizer = optim.AdamW(
-        list(actor.parameters()),
-        lr=torch.tensor(args.actor_learning_rate, device=device),
-        weight_decay=args.weight_decay,
-    )
-    critic_optimizer = optim.AdamW(
-        list(critic.parameters()),
-        lr=torch.tensor(args.critic_learning_rate, device=device),
-        weight_decay=args.weight_decay,
+    print("Creating DCLP network...")
+    # Create single DCLP instance that contains both actor and critic
+    dclp = DCLP(
+        state_dim=n_obs,
+        action_dim=n_act,
+        lr=args.actor_learning_rate,
+        gamma=args.gamma,
+        tau=args.tau,
+        alpha=0.2,  # Entropy coefficient
+        hidden_sizes=(args.actor_hidden_dim, args.actor_hidden_dim, args.actor_hidden_dim, args.actor_hidden_dim),
+        device=device
     )
     
-    # Learning rate schedulers
-    actor_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        actor_optimizer,
-        T_max=args.total_timesteps,
-        eta_min=torch.tensor(args.actor_learning_rate_end, device=device),
-    )
-    critic_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        critic_optimizer,
-        T_max=args.total_timesteps,
-        eta_min=torch.tensor(args.critic_learning_rate_end, device=device),
-    )
+    print("DCLP network initialized successfully")
+    
+    # Optimizers are already initialized within the DCLP class
     
     print("Optimizers and schedulers initialized successfully")
     
@@ -317,17 +299,11 @@ def main():
     
     print("Replay buffer initialized successfully")
     
-    # Compile models if requested
-    if args.compile:
-        print("Compiling models...")
-        actor = torch.compile(actor, mode=args.compile_mode)
-        critic = torch.compile(critic, mode=args.compile_mode)
-        critic_target = torch.compile(critic_target, mode=args.compile_mode)
+    # Note: Model compilation is handled internally by DCLP if needed
     
     def evaluate():
         """Evaluation function"""
         print("Running evaluation...")
-        actor.eval()
         
         eval_returns = []
         eval_lengths = []
@@ -339,8 +315,15 @@ def main():
             
             with torch.no_grad():
                 for step in range(envs.max_episode_steps):
-                    norm_obs = obs_normalizer(obs, update=False)
-                    action = actor.explore(norm_obs, deterministic=True)
+                    # Apply normalization if needed
+                    if args.obs_normalization:
+                        norm_obs = obs_normalizer(obs, update=False)
+                    else:
+                        norm_obs = obs
+                        
+                    # Get action from DCLP
+                    action_np = dclp.get_action(norm_obs[0].cpu().numpy(), deterministic=True)
+                    action = torch.from_numpy(action_np).unsqueeze(0).to(device)
                     
                     obs, reward, done, info = envs.step(action)
                     episode_return += reward[0].item()
@@ -363,84 +346,45 @@ def main():
                 "eval/mean_length": mean_length,
             })
         
-        actor.train()
         return mean_return
     
-    def update_critic(data, logs_dict):
-        """Update critic network"""
-        critic_optimizer.zero_grad()
+    def update_dclp(data, logs_dict):
+        """Update DCLP network (both actor and critic)"""
         
-        with autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
-            # Get current Q-values
-            q1_curr, q2_curr = critic(data["obs"], data["act"])
-            
-            # Compute target Q-values
-            with torch.no_grad():
-                target_noise = torch.randn_like(data["act"]) * args.policy_noise
-                target_noise = torch.clamp(target_noise, -args.noise_clip, args.noise_clip)
-                
-                next_action = actor.explore(
-                    obs_normalizer(data["obs2"], update=False), 
-                    deterministic=True
-                ) + target_noise
-                next_action = torch.clamp(next_action, -1.0, 1.0)
-                
-                target_q1, target_q2 = critic_target(data["obs2"], next_action)
-                target_q = torch.min(target_q1, target_q2)
-                
-                y = data["rew"] + args.gamma * (1 - data["done"]) * target_q
-            
-            # Critic loss
-            critic_loss = F.mse_loss(q1_curr, y) + F.mse_loss(q2_curr, y)
+        # Extract data from TensorDict format
+        observations = data["observations"].float()  # Convert from float16 to float32
+        actions = data["actions"]
+        rewards = data["next"]["rewards"]
+        next_observations = data["next"]["observations"].float()  # Convert from float16 to float32
+        dones = data["next"]["dones"].bool()
         
-        # Backward pass
-        scaler.scale(critic_loss).backward()
+        # Apply normalization if needed
+        if args.obs_normalization:
+            normalized_obs = obs_normalizer(observations, update=True)
+            normalized_next_obs = obs_normalizer(next_observations, update=False)
+        else:
+            normalized_obs = observations
+            normalized_next_obs = next_observations
         
-        if args.use_grad_norm_clipping:
-            scaler.unscale_(critic_optimizer)
-            torch.nn.utils.clip_grad_norm_(critic.parameters(), args.max_grad_norm)
+        # Prepare batch data for DCLP
+        batch = {
+            'state': normalized_obs.cpu().numpy(),
+            'action': actions.cpu().numpy(),
+            'reward': rewards.cpu().numpy(),
+            'next_state': normalized_next_obs.cpu().numpy(),
+            'done': dones.cpu().numpy()
+        }
         
-        scaler.step(critic_optimizer)
-        scaler.update()
+        # Train DCLP
+        train_metrics = dclp.train_step(batch)
         
-        logs_dict["train/critic_loss"] = critic_loss.item()
-    
-    def update_actor(data, logs_dict):
-        """Update actor network"""
-        actor_optimizer.zero_grad()
-        
-        with autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
-            actions = actor.explore(
-                obs_normalizer(data["obs"], update=False),
-                deterministic=True
-            )
-            q1, q2 = critic(data["obs"], actions)
-            actor_loss = -torch.min(q1, q2).mean()
-        
-        # Backward pass
-        scaler.scale(actor_loss).backward()
-        
-        if args.use_grad_norm_clipping:
-            scaler.unscale_(actor_optimizer)
-            torch.nn.utils.clip_grad_norm_(actor.parameters(), args.max_grad_norm)
-        
-        scaler.step(actor_optimizer)
-        scaler.update()
-        
-        logs_dict["train/actor_loss"] = actor_loss.item()
-    
-    @torch.no_grad()
-    def soft_update_target():
-        """Soft update target network"""
-        for param, target_param in zip(critic.parameters(), critic_target.parameters()):
-            target_param.data.copy_(
-                args.tau * param.data + (1 - args.tau) * target_param.data
-            )
+        # Log metrics
+        logs_dict.update(train_metrics)
     
     # Training loop
     global_step = 0
     obs = envs.reset(random_start_init=False)
-    dones = torch.zeros(args.num_envs, device=device)
+    dones = torch.zeros(args.num_envs, dtype=torch.bool, device=device)
     
     pbar = tqdm.tqdm(total=args.total_timesteps, initial=global_step)
     start_time = time.time()
@@ -454,9 +398,20 @@ def main():
                 # Random actions during warmup
                 actions = torch.rand(args.num_envs, n_act, device=device) * 2 - 1
             else:
-                # Policy actions
-                norm_obs = obs_normalizer(obs, update=False)
-                actions = actor.explore(norm_obs, dones=dones)
+                # Policy actions from DCLP
+                if args.obs_normalization:
+                    norm_obs = obs_normalizer(obs, update=False)
+                else:
+                    norm_obs = obs
+                
+                # Get actions from all environments
+                action_list = []
+                for i in range(args.num_envs):
+                    obs_np = norm_obs[i].cpu().numpy()
+                    action_np = dclp.get_action(obs_np, deterministic=False)
+                    action_list.append(action_np)
+                
+                actions = torch.from_numpy(np.array(action_list)).to(device)
         
         next_obs, rewards, next_dones, infos = envs.step(actions)
         
@@ -465,8 +420,21 @@ def main():
             reward_normalizer.update_stats(rewards, next_dones)
         normalized_rewards = reward_normalizer(rewards)
         
-        # Store transitions
-        rb.add(obs, actions, normalized_rewards, next_obs, dones, next_dones)
+        # Store transitions using TensorDict format
+        tensor_dict = TensorDict({
+            "observations": obs,
+            "actions": actions,
+            "critic_observations": obs if not envs.asymmetric_obs else obs,  # DCLP uses same obs
+            "next": TensorDict({
+                "observations": next_obs,
+                "critic_observations": next_obs if not envs.asymmetric_obs else next_obs,
+                "rewards": normalized_rewards,
+                "dones": dones,
+                "truncations": next_dones,
+            })
+        })
+        
+        rb.extend(tensor_dict)
         
         # Update normalizers
         if args.obs_normalization:
@@ -483,23 +451,12 @@ def main():
                 data = rb.sample(args.batch_size)
                 logs_dict = {}
                 
-                # Update critic
-                update_critic(data, logs_dict)
-                
-                # Update actor (delayed)
-                if global_step % args.policy_frequency == 0:
-                    update_actor(data, logs_dict)
-                    soft_update_target()
-                
-                # Update learning rates
-                actor_scheduler.step()
-                critic_scheduler.step()
+                # Update DCLP (both actor and critic)
+                update_dclp(data, logs_dict)
                 
                 # Log training metrics
                 if args.use_wandb and len(logs_dict) > 0:
                     logs_dict["train/global_step"] = global_step
-                    logs_dict["train/actor_lr"] = actor_optimizer.param_groups[0]['lr']
-                    logs_dict["train/critic_lr"] = critic_optimizer.param_groups[0]['lr']
                     wandb.log(logs_dict)
         
         # Periodic evaluation
@@ -508,16 +465,10 @@ def main():
         
         # Periodic model saving
         if global_step % args.save_interval == 0 and global_step > 0:
-            save_params(
-                global_step,
-                actor,
-                critic,
-                critic_target,
-                obs_normalizer,
-                critic_obs_normalizer,
-                args,
-                f"models/{run_name}_{global_step}.pt",
-            )
+            os.makedirs("models", exist_ok=True)
+            save_path = f"models/{run_name}_{global_step}.pt"
+            dclp.save(save_path)
+            print(f"Model saved to {save_path}")
         
         # Update progress bar
         if global_step % 1000 == 0:
@@ -533,23 +484,17 @@ def main():
     print("🏁 Training completed!")
     final_return = evaluate()
     
-    save_params(
-        global_step,
-        actor,
-        critic,
-        critic_target,
-        obs_normalizer,
-        critic_obs_normalizer,
-        args,
-        f"models/{run_name}_final.pt",
-    )
+    os.makedirs("models", exist_ok=True)
+    final_save_path = f"models/{run_name}_final.pt"
+    dclp.save(final_save_path)
     
     print(f"✅ Final evaluation return: {final_return:.2f}")
-    print(f"💾 Model saved to: models/{run_name}_final.pt")
+    print(f"💾 Model saved to: {final_save_path}")
     
     if args.use_wandb:
         wandb.finish()
 
 
 if __name__ == "__main__":
+    main()
     main()

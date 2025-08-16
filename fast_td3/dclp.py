@@ -42,8 +42,8 @@ class MLPGaussianPolicy(nn.Module):
         num_lidar_points = 90  # 270/3
         lidar_raw = obs[:, :270].reshape(batch_size, num_lidar_points, 3)
         # 处理距离信息(第3个特征) - 使用简单的激活函数替代
-        lidar_raw[:, :, 2] = torch.clamp(1.0 / (lidar_raw[:, :, 2] + self.alpha_activation_param + 1e-8), 
-                                        min=1e-6, max=1e6)
+        lidar_raw[:, :, 2] = reciprocal_relu(lidar_raw[:, :, 2],
+                                             alpha_activation=self.alpha_activation_param)
 
         cnn = getattr(self, 'cnn', None)
         if cnn is None:
@@ -68,8 +68,24 @@ class MLPGaussianPolicy(nn.Module):
         constrained_log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (constrained_log_std + 1)
         component_std_devs = torch.exp(constrained_log_std)
         
-        # 选择组件
-        selected_component_idx = torch.multinomial(torch.softmax(log_mixture_weights, dim=-1), num_samples=1)
+        # 选择组件 - 使用数值稳定的softmax
+        # 检查和处理 NaN/inf 值
+        if torch.any(torch.isnan(log_mixture_weights)) or torch.any(torch.isinf(log_mixture_weights)):
+            log_mixture_weights = torch.zeros_like(log_mixture_weights)
+        
+        # 对数权重进行裁剪以确保数值稳定性
+        clipped_log_weights = torch.clamp(log_mixture_weights, min=-10.0, max=10.0)
+        mixture_probs = torch.softmax(clipped_log_weights, dim=-1)
+        
+        # 再次检查和修复概率
+        if torch.any(torch.isnan(mixture_probs)) or torch.any(mixture_probs < 0):
+            mixture_probs = torch.ones_like(mixture_probs) / mixture_probs.shape[-1]
+        
+        # 确保概率都是正数且和为1
+        mixture_probs = torch.clamp(mixture_probs, min=1e-8, max=1.0)
+        mixture_probs = mixture_probs / mixture_probs.sum(dim=-1, keepdim=True)
+        
+        selected_component_idx = torch.multinomial(mixture_probs, num_samples=1)
         
         # 获取选中组件的参数
         batch_indices = torch.arange(batch_size, device=obs.device)
@@ -274,8 +290,8 @@ class DCLP:
         # Optimizers
         self.actor_optimizer = torch.optim.Adam(self.actor_critic.policy_network.parameters(), lr=lr)
         self.critic_optimizer = torch.optim.Adam(
-            list(self.actor_critic.shared_cnn_dense.parameters()) + 
-            list(self.actor_critic.q_network_1.parameters()) + 
+            list(self.actor_critic.shared_cnn_dense.parameters()) +
+            list(self.actor_critic.q_network_1.parameters()) +
             list(self.actor_critic.q_network_2.parameters()), lr=lr
         )
         

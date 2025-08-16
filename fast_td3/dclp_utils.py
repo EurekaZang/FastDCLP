@@ -54,7 +54,8 @@ def clip_min_with_gradient_passthrough(input_tensor, lower_bound=EPS):
     """
 
     clip_low_mask = (input_tensor < lower_bound).float()
-    return input_tensor + (lower_bound - input_tensor) * clip_low_mask
+    lower_bound_tensor = torch.tensor(lower_bound, device=input_tensor.device, dtype=input_tensor.dtype)
+    return input_tensor + (lower_bound_tensor - input_tensor) * clip_low_mask
 
 def reciprocal_relu(input_features, alpha_activation):
     """
@@ -70,7 +71,17 @@ def reciprocal_relu(input_features, alpha_activation):
         torch.Tensor: The result of applying the modified activation function.
     """
 
-    reciprocal_result = torch.reciprocal(clip_min_with_gradient_passthrough(input_features + alpha_activation, lower_bound=EPS))
+    # 检查输入是否包含 NaN 或 inf
+    if torch.any(torch.isnan(input_features)) or torch.any(torch.isinf(input_features)):
+        input_features = torch.clamp(input_features, min=-10.0, max=10.0)
+    
+    clipped_input = clip_min_with_gradient_passthrough(input_features + alpha_activation, lower_bound=EPS)
+    reciprocal_result = torch.reciprocal(clipped_input)
+    
+    # 检查输出是否包含 NaN 或 inf
+    if torch.any(torch.isnan(reciprocal_result)) or torch.any(torch.isinf(reciprocal_result)):
+        reciprocal_result = torch.clamp(reciprocal_result, min=EPS, max=1.0/EPS)
+    
     return reciprocal_result
 
 def create_log_gaussian(mean_tensor, log_std_tensor, sample_points):

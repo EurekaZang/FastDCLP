@@ -107,6 +107,10 @@ class SimpleReplayBuffer(nn.Module):
                 )
         print("asymmetric_obs success")
         self.ptr = 0
+    
+    @property
+    def size(self):
+        return min(self.buffer_size, self.ptr)
 
     @torch.no_grad()
     def extend(
