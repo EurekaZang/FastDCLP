@@ -226,6 +226,7 @@ def main():
 
         print("Using FastTD3 + SimbaV2")
         actor_kwargs.pop("init_scale")
+        print("actor_kwargs updated successfully")
         actor_kwargs.update(
             {
                 "scaler_init": math.sqrt(2.0 / args.actor_hidden_dim),
@@ -237,6 +238,7 @@ def main():
                 "num_blocks": args.actor_num_blocks,
             }
         )
+        print("actor_kwargs updated successfully")
         critic_kwargs.update(
             {
                 "scaler_init": math.sqrt(2.0 / args.critic_hidden_dim),
@@ -248,36 +250,47 @@ def main():
                 "c_shift": 3.0,
             }
         )
+        print("critic_kwargs updated successfully")
     else:
         raise ValueError(f"Agent {args.agent} not supported")
 
+    print(f"Using actor: {actor_cls.__name__} and critic: {critic_cls.__name__}")
+
     actor = actor_cls(**actor_kwargs)
+    print("Actor initialized successfully")
 
     if env_type in ["mtbench"]:
         # Python 3.8 doesn't support 'from_module' in tensordict
         policy = actor.explore
     else:
         from tensordict import from_module
+        print("Using tensordict from_module for policy")
 
         actor_detach = actor_cls(**actor_kwargs)
+        print("Actor detached initialized successfully")
         # Copy params to actor_detach without grad
         from_module(actor).data.to_module(actor_detach)
+        print("Actor detached params copied successfully")
         policy = actor_detach.explore
+        print("Policy created successfully")
 
     qnet = critic_cls(**critic_kwargs)
     qnet_target = critic_cls(**critic_kwargs)
     qnet_target.load_state_dict(qnet.state_dict())
+    print("Critic and target critic initialized successfully")
 
     q_optimizer = optim.AdamW(
         list(qnet.parameters()),
         lr=torch.tensor(args.critic_learning_rate, device=device),
         weight_decay=args.weight_decay,
     )
+    print("Q-optimizer initialized successfully")
     actor_optimizer = optim.AdamW(
         list(actor.parameters()),
         lr=torch.tensor(args.actor_learning_rate, device=device),
         weight_decay=args.weight_decay,
     )
+    print("Actor-optimizer initialized successfully")
 
     # Add learning rate schedulers
     q_scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -285,11 +298,13 @@ def main():
         T_max=args.total_timesteps,
         eta_min=torch.tensor(args.critic_learning_rate_end, device=device),
     )
+    print("Q-scheduler initialized successfully")
     actor_scheduler = optim.lr_scheduler.CosineAnnealingLR(
         actor_optimizer,
         T_max=args.total_timesteps,
         eta_min=torch.tensor(args.actor_learning_rate_end, device=device),
     )
+    print("Actor-scheduler initialized successfully")
 
     rb = SimpleReplayBuffer(
         n_env=args.num_envs,
@@ -303,6 +318,7 @@ def main():
         gamma=args.gamma,
         device=device,
     )
+    print("Replay buffer initialized successfully")
 
     policy_noise = args.policy_noise
     noise_clip = args.noise_clip
@@ -384,6 +400,26 @@ def main():
         return renders
 
     def update_main(data, logs_dict):
+        """
+        Performs a single update step for the critic networks in the TD3 algorithm using distributional projection.
+
+        Args:
+            data (dict): A batch of experience data containing observations, actions, rewards, dones, truncations, and other relevant fields.
+            logs_dict (dict): A dictionary for logging training statistics.
+
+        Returns:
+            dict: Updated logs_dict containing critic gradient norm, Q-function loss, and statistics about the target Q-values.
+
+        Details:
+            - Applies automatic mixed precision (AMP) if enabled.
+            - Handles asymmetric observation spaces if specified by the environment.
+            - Computes target Q-value distributions using the target Q-network and the actor with added clipped noise for policy smoothing.
+            - Supports conditional double Q-learning (CDQ) if enabled.
+            - Calculates the critic loss as the negative log-likelihood between predicted and target Q-value distributions.
+            - Applies gradient norm clipping if enabled.
+            - Updates the optimizer and AMP scaler.
+            - Logs relevant statistics for monitoring training progress.
+        """
         with autocast(
             device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
         ):

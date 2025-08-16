@@ -8,6 +8,11 @@ import torch.distributed as dist
 
 from tensordict import TensorDict
 
+def log_vram(prefix=""):
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        print(f"{prefix} VRAM allocated: {allocated:.2f} GB, reserved: {reserved:.2f} GB")
 
 class SimpleReplayBuffer(nn.Module):
     def __init__(
@@ -45,23 +50,39 @@ class SimpleReplayBuffer(nn.Module):
         self.gamma = gamma
         self.n_steps = n_steps
         self.device = device
+        # print(f"n_env: {n_env}, buffer_size: {buffer_size}, n_obs: {n_obs}, n_act: {n_act}, n_critic_obs: {n_critic_obs}, asymmetric_obs: {asymmetric_obs}, playground_mode: {playground_mode}, n_steps: {n_steps}, gamma: {gamma}, device: {device}\n")
+        """
+        n_env: 1024, buffer_size: 10240, n_obs: 1090,
+        n_act: 2, n_critic_obs: 1090, asymmetric_obs: False,
+        playground_mode: False, n_steps: 1, gamma: 0.99, device: cuda:0
+        """
 
+        # n_env: 1024, buffer_size: 10240, n_obs: 1090 (float16) --> 21.3 GB
+        # n_env: 1024, buffer_size: 10240, n_obs: 124  (float16) --> 2.4 GB
+        log_vram("Initializing SimpleReplayBuffer: \n")
         self.observations = torch.zeros(
-            (n_env, buffer_size, n_obs), device=device, dtype=torch.float
+            (n_env, buffer_size, n_obs), device=device, dtype=torch.float16
         )
+        log_vram("Observations buffer initialized: \n")
         self.actions = torch.zeros(
             (n_env, buffer_size, n_act), device=device, dtype=torch.float
         )
         self.rewards = torch.zeros(
             (n_env, buffer_size), device=device, dtype=torch.float
         )
+        log_vram("Actions and rewards buffers initialized: \n")
         self.dones = torch.zeros((n_env, buffer_size), device=device, dtype=torch.long)
+        log_vram("Dones buffer initialized: \n")
         self.truncations = torch.zeros(
             (n_env, buffer_size), device=device, dtype=torch.long
         )
+        log_vram("Truncations buffer initialized: \n")
+
+        # n_env: 1024, buffer_size: 10240, n_obs: 1090 (float16) --> 21.3 GB
         self.next_observations = torch.zeros(
-            (n_env, buffer_size, n_obs), device=device, dtype=torch.float
+            (n_env, buffer_size, n_obs), device=device, dtype=torch.float16
         )
+        log_vram("Next observations buffer initialized: \n")
         if asymmetric_obs:
             if self.playground_mode:
                 # Only store the privileged part of observations (n_critic_obs - n_obs)
@@ -79,11 +100,12 @@ class SimpleReplayBuffer(nn.Module):
             else:
                 # Store full critic observations
                 self.critic_observations = torch.zeros(
-                    (n_env, buffer_size, n_critic_obs), device=device, dtype=torch.float
+                    (n_env, buffer_size, n_critic_obs), device=device, dtype=torch.float16
                 )
                 self.next_critic_observations = torch.zeros(
-                    (n_env, buffer_size, n_critic_obs), device=device, dtype=torch.float
+                    (n_env, buffer_size, n_critic_obs), device=device, dtype=torch.float16
                 )
+        print("asymmetric_obs success")
         self.ptr = 0
 
     @torch.no_grad()
@@ -123,6 +145,32 @@ class SimpleReplayBuffer(nn.Module):
 
     @torch.no_grad()
     def sample(self, batch_size: int):
+        """
+        Sample a batch of transitions from the replay buffer for training.
+
+        Depending on the value of `n_steps`, this method samples either single-step or n-step transitions for each environment in the buffer. It supports both symmetric and asymmetric observation settings, as well as privileged observations for playground mode.
+
+        Args:
+            batch_size (int): Number of samples to draw per environment.
+
+        Returns:
+            TensorDict: A dictionary-like object containing the following keys:
+                - "observations" (Tensor): Sampled observations of shape [n_env * batch_size (default to 1024 * 8192), n_obs].
+                - "actions" (Tensor): Sampled actions of shape [n_env * batch_size, n_act].
+                - "next" (dict): Dictionary containing:
+                    - "rewards" (Tensor): Sampled (possibly n-step discounted) rewards of shape [n_env * batch_size].
+                    - "dones" (Tensor): Done flags for the sampled transitions of shape [n_env * batch_size].
+                    - "truncations" (Tensor): Truncation flags for the sampled transitions of shape [n_env * batch_size].
+                    - "observations" (Tensor): Next observations of shape [n_env * batch_size, n_obs].
+                    - "effective_n_steps" (Tensor): Number of effective steps until done/truncation for each sample.
+                - "critic_observations" (Tensor, optional): Critic observations if asymmetric_obs is True.
+                - "next/critic_observations" (Tensor, optional): Next critic observations if asymmetric_obs is True.
+
+        Notes:
+            - For n-step sampling, the method ensures that sampled sequences do not cross episode boundaries by masking rewards after the first done or truncation.
+            - When the buffer is full, temporary modifications are made to truncation flags to prevent sampling across episodes, which are rolled back after sampling.
+            - Supports both symmetric and asymmetric observation spaces, as well as privileged observations for playground mode.
+        """
         # we will sample n_env * batch_size transitions
 
         if self.n_steps == 1:

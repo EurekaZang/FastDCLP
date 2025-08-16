@@ -2,6 +2,41 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class CNNNet(nn.Module):
+    """
+    CNNNet is a 1D Convolutional Neural Network module for feature extraction from sequential data.
+    Args:
+        activation (callable, optional): Activation function to use after each convolutional layer. Default is F.relu.
+        output_activation (callable, optional): Activation function to use at the output layer. Default is None.
+    Layers:
+        conv_layer_1 (nn.Conv1d): First 1D convolutional layer (in_channels=6, out_channels=32, kernel_size=1).
+        conv_layer_2 (nn.Conv1d): Second 1D convolutional layer (in_channels=32, out_channels=64, kernel_size=1).
+        conv_layer_3 (nn.Conv1d): Third 1D convolutional layer (in_channels=64, out_channels=128, kernel_size=1).
+        max_pool (nn.MaxPool1d): 1D max pooling layer (kernel_size=90, stride=1).
+    Forward Input:
+        input_tensor (torch.Tensor): Input tensor of shape [batch_size, sequence_length, features].
+        additional_input (optional): Unused, for compatibility.
+    Forward Output:
+        torch.Tensor: Flattened feature tensor after convolution and pooling, shape [batch_size, features_out].
+    """
+
+    def __init__(self, activation=F.relu, output_activation=None):
+        super(CNNNet, self).__init__()
+        self.conv_layer_1 = nn.Conv1d(6, 32, kernel_size=1, stride=1, padding=0)
+        self.conv_layer_2 = nn.Conv1d(32, 64, kernel_size=1, stride=1, padding=0)
+        self.conv_layer_3 = nn.Conv1d(64, 128, kernel_size=1, stride=1, padding=0)
+        self.max_pool = nn.MaxPool1d(kernel_size=90, stride=1, padding=0)
+        self.activation_func = activation
+
+    def forward(self, input_tensor, additional_input=None):
+        # input_tensor shape: [batch_size, sequence_length, features] -> [batch_size, features, sequence_length]
+        transposed_input = input_tensor.transpose(1, 2)
+        conv1_output = F.leaky_relu(self.conv_layer_1(transposed_input))
+        conv2_output = F.leaky_relu(self.conv_layer_2(conv1_output))
+        conv3_output = F.leaky_relu(self.conv_layer_3(conv2_output))
+        pooled_output = self.max_pool(conv3_output)
+        flattened_features = pooled_output.view(pooled_output.size(0), -1)
+        return flattened_features
 
 class DistributionalQNetwork(nn.Module):
     def __init__(
@@ -29,7 +64,18 @@ class DistributionalQNetwork(nn.Module):
         self.num_atoms = num_atoms
 
     def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        # obs: [1090,] the first 1080 elements are LiDAR data
+        # obs: [n_env * batch_size, n_obs] = [1024 * 8192, 1090] in each row the first 1080 elements are LiDAR data
+        # actions: [n_env * batch_size, n_act]
+        """
+        +------------+--------------------------+----------------+
+        |   Index    | Name                     |     Shape      |
+        +------------+--------------------------+----------------+
+        |     0      | lidar_data               |    (1080,)     |
+        |     1      | base_lin_vel             |      (3,)      |
+        |     2      | base_ang_vel             |      (3,)      |
+        |     3      | pose_command             |      (4,)      |
+        +------------+--------------------------+----------------+
+        """
         x = torch.cat([obs, actions], 1)
         x = self.net(x)
         return x
