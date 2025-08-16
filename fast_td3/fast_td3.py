@@ -29,7 +29,8 @@ class DistributionalQNetwork(nn.Module):
         self.num_atoms = num_atoms
 
     def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        # obs: [1090,] the first 1080 elements are LiDAR data
+        # obs: [n_env * batch_size, n_obs] = [1024 * 32, 280] in each row the first 270 elements are LiDAR data
+        # actions: [n_env * batch_size, n_act]
         x = torch.cat([obs, actions], 1)
         x = self.net(x)
         return x
