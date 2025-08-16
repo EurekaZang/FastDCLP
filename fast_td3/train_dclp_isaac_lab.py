@@ -296,50 +296,74 @@ def main():
         gamma=args.gamma,
         device=device,
     )
-    
     print("Replay buffer initialized successfully")
-    
     # Note: Model compilation is handled internally by DCLP if needed
-    
     def evaluate():
         """Evaluation function"""
         print("Running evaluation...")
-        
+        print(f"Max episode steps: {envs.max_episode_steps}")
+        print(f"Number of environments: {envs.num_envs}")
         eval_returns = []
         eval_lengths = []
-        
-        for eval_ep in range(min(10, args.num_envs)):
+        num_eval_episodes = min(3, args.num_envs)  # Use fewer episodes for faster evaluation
+        eval_pbar = tqdm.tqdm(range(num_eval_episodes), desc="🔍 Evaluation Episodes", leave=False)
+        for eval_ep in eval_pbar:
             obs = envs.reset(random_start_init=False)
             episode_return = 0.0
             episode_length = 0
-            
+            print(f"\nStarting evaluation episode {eval_ep+1}")
+            # Add progress bar for steps within each episode with early stopping
+            max_eval_steps = min(500, envs.max_episode_steps)  # Limit evaluation to 500 steps max
+            step_pbar = tqdm.tqdm(range(max_eval_steps),
+                                desc=f"Episode {eval_ep+1}/{num_eval_episodes}",
+                                leave=False)
             with torch.no_grad():
-                for step in range(envs.max_episode_steps):
+                for step in step_pbar:
                     # Apply normalization if needed
                     if args.obs_normalization:
                         norm_obs = obs_normalizer(obs, update=False)
                     else:
                         norm_obs = obs
-                        
                     # Get action from DCLP
                     action_np = dclp.get_action(norm_obs[0].cpu().numpy(), deterministic=True)
                     action = torch.from_numpy(action_np).unsqueeze(0).to(device)
-                    
                     obs, reward, done, info = envs.step(action)
-                    episode_return += reward[0].item()
+                    # Check for NaN in rewards and handle
+                    reward_value = reward[0].item()
+                    if np.isnan(reward_value) or np.isinf(reward_value):
+                        print(f"Warning: Invalid reward {reward_value} at step {episode_length}, setting to 0")
+                        reward_value = 0.0
+                    episode_return += reward_value
                     episode_length += 1
-                    
+                    # Update step progress bar with current reward
+                    step_pbar.set_postfix({
+                        'Return': f'{episode_return:.2f}', 
+                        'Reward': f'{reward_value:.3f}',
+                        'Length': episode_length,
+                        'Done': done.sum().item()
+                    })
                     if done[0]:
+                        print(f"Episode {eval_ep+1} finished at step {episode_length} (done=True)")
                         break
-            
+                    # Early stopping if episode gets too long without progress
+                    if episode_length >= max_eval_steps:
+                        print(f"Episode {eval_ep+1} truncated at {max_eval_steps} steps for faster evaluation")
+                        break
+                    # Print progress every 100 steps if episode is long
+                    if episode_length % 100 == 0:
+                        print(f"Episode {eval_ep+1}: Step {episode_length}, Return: {episode_return:.2f}, Last Reward: {reward_value:.3f}")
+            step_pbar.close()
             eval_returns.append(episode_return)
             eval_lengths.append(episode_length)
-        
+            # Update episode progress bar
+            eval_pbar.set_postfix({
+                'Avg Return': f'{np.mean(eval_returns):.2f}',
+                'Avg Length': f'{np.mean(eval_lengths):.1f}'
+            })
+        eval_pbar.close()
         mean_return = np.mean(eval_returns)
         mean_length = np.mean(eval_lengths)
-        
         print(f"Eval: Mean Return = {mean_return:.2f}, Mean Length = {mean_length:.1f}")
-        
         if args.use_wandb:
             wandb.log({
                 "eval/mean_return": mean_return,
