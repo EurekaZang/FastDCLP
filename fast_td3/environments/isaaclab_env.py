@@ -67,7 +67,6 @@ class IsaacLabEnv:
         if self.action_bounds is not None:
             actions = torch.clamp(actions, -1.0, 1.0) * self.action_bounds
         obs_dict, rew, terminations, truncations, infos = self.envs.step(actions)
-        # Debug print removed for cleaner output
         dones = (terminations | truncations).to(dtype=torch.long)
         obs = obs_dict["policy"]
         critic_obs = obs_dict["critic"] if self.asymmetric_obs else None
