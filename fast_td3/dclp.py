@@ -41,7 +41,6 @@ class MLPGaussianPolicy(nn.Module):
         batch_size = obs.shape[0]
         num_lidar_points = 90  # 270/3
         lidar_raw = obs[:, :270].reshape(batch_size, num_lidar_points, 3)
-        # 处理距离信息(第3个特征) - 使用简单的激活函数替代
         lidar_raw[:, :, 2] = reciprocal_relu(lidar_raw[:, :, 2],
                                              alpha_activation=self.alpha_activation_param)
 
@@ -52,56 +51,56 @@ class MLPGaussianPolicy(nn.Module):
         flattened_features = cnn(lidar_raw)
         obs_rest = obs[:, 270:]  # [batch_size, n_obs-270]
         obs_new = torch.cat([flattened_features, obs_rest], dim=1)
-        
+
         # 直接处理观测，不需要动作输入
         x = self.net(obs_new)
         gmm_parameters = self.gmm_output_layer(x)
         reshaped_gmm_params = gmm_parameters.view(-1, self.num_mixture_components, 2*self.action_dimension+1)
-        
+
         # divide parameters
         log_mixture_weights = reshaped_gmm_params[..., 0]              # [N, K]
         component_means = reshaped_gmm_params[..., 1:1+self.action_dimension]       # [N, K, action_dimension]
         log_component_std = reshaped_gmm_params[..., 1+self.action_dimension:]   # [N, K, action_dimension]
-        
+
         # constrain log std to safe range
         constrained_log_std = torch.tanh(log_component_std)
         constrained_log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (constrained_log_std + 1)
         component_std_devs = torch.exp(constrained_log_std)
-        
+
         # 选择组件 - 使用数值稳定的softmax
         # 检查和处理 NaN/inf 值
         if torch.any(torch.isnan(log_mixture_weights)) or torch.any(torch.isinf(log_mixture_weights)):
             log_mixture_weights = torch.zeros_like(log_mixture_weights)
-        
+
         # 对数权重进行裁剪以确保数值稳定性
         clipped_log_weights = torch.clamp(log_mixture_weights, min=-10.0, max=10.0)
         mixture_probs = torch.softmax(clipped_log_weights, dim=-1)
-        
+
         # 再次检查和修复概率
         if torch.any(torch.isnan(mixture_probs)) or torch.any(mixture_probs < 0):
             mixture_probs = torch.ones_like(mixture_probs) / mixture_probs.shape[-1]
-        
+
         # 确保概率都是正数且和为1
         mixture_probs = torch.clamp(mixture_probs, min=1e-8, max=1.0)
         mixture_probs = mixture_probs / mixture_probs.sum(dim=-1, keepdim=True)
-        
+
         selected_component_idx = torch.multinomial(mixture_probs, num_samples=1)
-        
+
         # 获取选中组件的参数
         batch_indices = torch.arange(batch_size, device=obs.device)
         selected_component_mean = component_means[batch_indices, selected_component_idx.squeeze(-1)]  # 选中组件均值
         selected_component_std = component_std_devs[batch_indices, selected_component_idx.squeeze(-1)]  # 选中组件标准差
-        
+
         # 重参数化采样：a = μ + σ * ε
         random_noise = torch.randn((batch_size, self.action_dimension), device=obs.device)
         sampled_action = selected_component_mean + selected_component_std * random_noise
-        
+
         # 计算动作概率
         component_log_probs = create_log_gaussian(component_means, constrained_log_std, sampled_action.unsqueeze(1))  # 各组件概率
         log_prob_numerator = torch.logsumexp(component_log_probs + log_mixture_weights, dim=1)  # 分子
         log_prob_denominator = torch.logsumexp(log_mixture_weights, dim=1)  # 分母
         log_probability = log_prob_numerator - log_prob_denominator  # 非原地操作
-        
+
         return selected_component_mean, sampled_action, log_probability
 
 

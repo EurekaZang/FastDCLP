@@ -170,14 +170,14 @@ def main():
         eval_lengths = []
         num_eval_episodes = min(3, args.num_envs)
         eval_pbar = tqdm.tqdm(range(num_eval_episodes), desc="🔍 Evaluation Episodes", leave=False)
-        for eval_ep in eval_pbar:
+        for evaluate_episode in eval_pbar:
             obs = envs.reset(random_start_init=False)
             episode_return = 0.0
             episode_length = 0
-            print(f"\nStarting evaluation episode {eval_ep+1}")
+            print(f"\nStarting evaluation episode {evaluate_episode+1}")
             max_eval_steps = min(1000, envs.max_episode_steps)
             step_pbar = tqdm.tqdm(range(max_eval_steps),
-                                desc=f"Episode {eval_ep+1}/{num_eval_episodes}",
+                                desc=f"Episode {evaluate_episode+1}/{num_eval_episodes}",
                                 leave=False)
             with torch.no_grad():
                 for step in step_pbar:
@@ -207,13 +207,13 @@ def main():
                         'Done': done.sum().item()
                     })
                     if done[0]:
-                        print(f"Episode {eval_ep+1} finished at step {episode_length} (done=True)")
+                        print(f"Episode {evaluate_episode+1} finished at step {episode_length} (done=True)")
                         break
                     if episode_length >= max_eval_steps:
-                        print(f"Episode {eval_ep+1} truncated at {max_eval_steps} steps for faster evaluation")
+                        print(f"Episode {evaluate_episode+1} truncated at {max_eval_steps} steps for faster evaluation")
                         break
                     if episode_length % 100 == 0:
-                        print(f"Episode {eval_ep+1}: Step {episode_length}, Return: {episode_return:.2f}, Last Reward: {reward.mean().item():.3f}")
+                        print(f"Episode {evaluate_episode+1}: Step {episode_length}, Return: {episode_return:.2f}, Last Reward: {reward.mean().item():.3f}")
             step_pbar.close()
             eval_returns.append(episode_return)
             eval_lengths.append(episode_length)
@@ -268,6 +268,7 @@ def main():
     # Training loop
     global_step = 0
     obs = envs.reset(random_start_init=False)
+    print(f"\n\n\n\n\n\n\n\nInitial observation shape: {obs.shape}")
     dones = torch.zeros(args.num_envs, dtype=torch.bool, device=device)
     pbar = tqdm.tqdm(total=args.total_timesteps, initial=global_step)
     start_time = time.time()
