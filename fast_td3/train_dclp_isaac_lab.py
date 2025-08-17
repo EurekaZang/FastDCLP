@@ -290,14 +290,13 @@ def main():
         n_obs=n_obs,
         n_act=n_act,
         n_critic_obs=n_critic_obs,
-        asymmetric_obs=False,  # DCLP uses symmetric observations
+        asymmetric_obs=False,
         playground_mode=False,
         n_steps=1,
         gamma=args.gamma,
         device=device,
     )
     print("Replay buffer initialized successfully")
-    # Note: Model compilation is handled internally by DCLP if needed
     def evaluate():
         """Evaluation function"""
         print("Running evaluation...")
@@ -305,47 +304,44 @@ def main():
         print(f"Number of environments: {envs.num_envs}")
         eval_returns = []
         eval_lengths = []
-        num_eval_episodes = min(3, args.num_envs)  # Use fewer episodes for faster evaluation
+        num_eval_episodes = min(3, args.num_envs)
         eval_pbar = tqdm.tqdm(range(num_eval_episodes), desc="🔍 Evaluation Episodes", leave=False)
         for eval_ep in eval_pbar:
             obs = envs.reset(random_start_init=False)
-
-
-
-            print(f"logging from train_dclp_isaac_lab.py, in def evaluate(), obs: {obs}")
-
-
-
             episode_return = 0.0
             episode_length = 0
             print(f"\nStarting evaluation episode {eval_ep+1}")
-            # Add progress bar for steps within each episode with early stopping
             max_eval_steps = min(1000, envs.max_episode_steps)
             step_pbar = tqdm.tqdm(range(max_eval_steps),
                                 desc=f"Episode {eval_ep+1}/{num_eval_episodes}",
                                 leave=False)
             with torch.no_grad():
                 for step in step_pbar:
-                    # Apply normalization if needed
                     if args.obs_normalization:
                         norm_obs = obs_normalizer(obs, update=False)
                     else:
                         norm_obs = obs
-                    # Get action from DCLP
-                    action_np = dclp.get_action(norm_obs[0].cpu().numpy(), deterministic=True)
-                    action = torch.from_numpy(action_np).unsqueeze(0).to(device)
+                    with torch.no_grad(), autocast(
+                        device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
+                    ):
+                        actions = dclp.get_action(norm_obs)
 
 
 
-                    print(f"logging from train_dclp_isaac_lab.py, in def evaluate(), action: {action}")
+                    print(f"logging from train_dclp_isaac_lab.py, in def evaluate(), action: {actions}")
 
 
 
-                    obs, reward, done, info = envs.step(action)
-                    # Check for NaN in rewards and handle
+                    obs, reward, done, info = envs.step(actions.float())
                     reward_value = reward[0].item()
                     if np.isnan(reward_value) or np.isinf(reward_value):
-                        # print(f"Warning: Invalid reward {reward_value} at step {episode_length}, setting to 0")
+
+
+
+                        print(f"Warning: Invalid reward {reward_value} at step {episode_length}, setting to 0")
+
+
+
                         reward_value = 0.0
                     episode_return += reward_value
                     episode_length += 1
@@ -427,63 +423,26 @@ def main():
     start_time = time.time()
     print("🚀 Starting DCLP training...")
     while global_step < args.total_timesteps:
-        # Collect experience
         with torch.no_grad():
             if global_step < args.learning_starts:
-                # Random actions during warmup
                 actions = torch.rand(args.num_envs, n_act, device=device) * 2 - 1
             else:
-                # Policy actions from DCLP
                 if args.obs_normalization:
                     norm_obs = obs_normalizer(obs, update=False)
                 else:
                     norm_obs = obs
-                # Get actions from all environments
-                action_list = []
-                for i in range(args.num_envs):
-                    obs_np = norm_obs[i].cpu().numpy()
-                    action_np = dclp.get_action(obs_np, deterministic=False)
-                    action_list.append(action_np)
-                actions = torch.from_numpy(np.array(action_list)).to(device)
-        next_obs, rewards, next_dones, infos = envs.step(actions)
-        """
-        logging from train_dclp_isaac_lab.py, reward: tensor
-              ([-1.7234e-03, -6.0878e-03,  4.2995e-03, -2.0225e-03, -5.6497e-03,
-                -3.4232e-03, -6.0270e-03, -2.0316e-03,  1.2355e-03, -4.2964e-03,
-                -1.6475e-03, -2.8515e-03, -5.0578e-03, -4.6423e-03, -8.9984e-04,
-                -1.9247e-03, -8.7600e-04, -5.7160e-03, -4.3742e-03, -3.0558e-03,
-                -4.8063e-03, -1.7325e-03, -4.1842e-03, -2.7988e-04, -6.0362e-03,
-                -3.5812e-03, -8.7350e-04, -2.7349e-03, -2.8279e-03,  7.1065e-04,
-                -4.6040e-04, -4.6155e-03, -2.6945e-03, -5.7214e-03, -4.9291e-03,
-                -4.4343e-03, -3.5490e-03, -2.6186e-03, -2.6987e-03, -4.9348e-03,
-                -4.5853e-04, -4.6465e-03, -6.6572e-04, -2.6347e-03,  1.5734e-03,
-                -6.0523e-04, -1.6945e-04, -4.7802e-03, -3.7882e-03, -1.5566e-03,
-                -1.5671e-03, -5.3054e-03, -7.1428e-04,  5.1441e-04, -5.2374e-03,
-                -2.0664e-03, -4.9999e-03,  3.2932e-03, -5.1108e-03, -2.8082e-03,
-                -1.1328e-03, -1.6073e-03, -1.2502e-03, -1.9768e-03, -2.7888e-03,
-                -8.2569e-04, -3.1015e-03, -1.3927e-03, -1.2510e-03, -4.1926e-03,
-                -4.5331e-03, -2.1995e-03, -2.3627e-03, -4.2268e-03, -4.4361e-03,
-                -8.7290e-04, -4.9463e-03, -1.2777e-04, -4.5610e-04, -5.3508e-03,
-                -1.8488e-03, -2.6004e-05, -6.2790e-05, -2.7726e-03, -4.0774e-03,
-                -3.4715e-03, -3.9555e-03, -6.0646e-04, -2.9909e-03, -4.3020e-03,
-                -1.1223e-03, -2.6565e-03, -3.7254e-03, -4.1492e-03, -5.2531e-03,
-                -3.6520e-03, -6.3783e-05, -5.3491e-03, -3.1877e-03, -6.3367e-03,
-                -2.9900e-03, -4.0275e-03, -2.9369e-03, -3.4721e-03, -2.1922e-03,
-                -1.7946e-05, -2.3076e-03, -1.5182e-03, -3.8016e-03, -3.3564e-04,
-                -1.0568e-03, -4.1820e-03, -5.0365e-03, -6.1753e-03, -1.7046e-04,
-                -5.0793e-03, -3.3210e-03, -4.4834e-03, -4.2532e-03, -4.9135e-03,
-                -4.9715e-03, -2.1635e-03, -1.3890e-03,  6.3612e-03, -4.2798e-03,
-                -5.6005e-03, -3.6872e-03, -3.9273e-03], device='cuda:0')
-        """
-        # Normalize rewards
+                with torch.no_grad(), autocast(
+                    device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
+                ):
+                    actions = dclp.get_action(norm_obs)
+        next_obs, rewards, next_dones, infos = envs.step(actions.float())
         if hasattr(reward_normalizer, 'update_stats'):
             reward_normalizer.update_stats(rewards, next_dones)
-        normalized_rewards = reward_normalizer(rewards)
-        # Store transitions using TensorDict format
+        normalized_rewards = reward_normalizer(rewards) # If --reward-normalization = False, this is identity
         tensor_dict = TensorDict({
             "observations": obs,
             "actions": actions,
-            "critic_observations": obs if not envs.asymmetric_obs else obs,  # DCLP uses same obs
+            "critic_observations": obs if not envs.asymmetric_obs else obs,
             "next": TensorDict({
                 "observations": next_obs,
                 "critic_observations": next_obs if not envs.asymmetric_obs else next_obs,

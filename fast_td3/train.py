@@ -341,9 +341,7 @@ def main():
             ):
                 obs = normalize_obs(obs, update=False)
                 actions = actor(obs)
-
             next_obs, rewards, dones, infos = eval_envs.step(actions.float())
-
             if env_type == "mtbench":
                 # We only report success rate in MTBench evaluation
                 rewards = (

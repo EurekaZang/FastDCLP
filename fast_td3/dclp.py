@@ -262,10 +262,9 @@ class DCLP:
                  alpha=0.2, hidden_sizes=(128, 128, 128, 128), device='cuda'):
         """
         Initialize DCLP algorithm
-        
         Args:
             state_dim: Dimension of state space
-            action_dim: Dimension of action space  
+            action_dim: Dimension of action space
             lr: Learning rate
             gamma: Discount factor
             tau: Soft update parameter
@@ -279,48 +278,39 @@ class DCLP:
         self.tau = tau
         self.alpha = alpha
         self.device = device
-        
-        # Initialize networks
         self.actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
         self.target_actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
-        
-        # Copy parameters to target network
         self.update_target_network(tau=1.0)
-        
-        # Optimizers
         self.actor_optimizer = torch.optim.Adam(self.actor_critic.policy_network.parameters(), lr=lr)
         self.critic_optimizer = torch.optim.Adam(
             list(self.actor_critic.shared_cnn_dense.parameters()) +
             list(self.actor_critic.q_network_1.parameters()) +
             list(self.actor_critic.q_network_2.parameters()), lr=lr
         )
-        
+
     def get_action(self, state, deterministic=False):
         """Get action from current policy"""
         with torch.no_grad():
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             if deterministic:
                 # Use mean action for deterministic policy
-                action_mean, _, _ = self.actor_critic.policy_network(state_tensor)
-                return action_mean.cpu().numpy()[0]
+                action_mean, _, _ = self.actor_critic.policy_network(state)
+                return action_mean
             else:
                 # Sample action from policy
-                _, sampled_action, _ = self.actor_critic.policy_network(state_tensor)
-                return sampled_action.cpu().numpy()[0]
-                
+                _, sampled_action, _ = self.actor_critic.policy_network(state)
+                return sampled_action
+
     def update_target_network(self, tau=None):
         """Soft update of target network parameters"""
         if tau is None:
             tau = self.tau
-            
         for target_param, param in zip(self.target_actor_critic.parameters(), 
                                      self.actor_critic.parameters()):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-            
+
     def train_step(self, batch):
         """
         Single training step
-        
         Args:
             batch: Dictionary containing 'state', 'action', 'reward', 'next_state', 'done'
         """
