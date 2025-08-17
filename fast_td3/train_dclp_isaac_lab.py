@@ -238,32 +238,12 @@ def main():
     else:
         obs_normalizer = nn.Identity()
         critic_obs_normalizer = nn.Identity()
-    
+
     if args.reward_normalization:
         reward_normalizer = RewardNormalizer(gamma=args.gamma, device=device)
     else:
         reward_normalizer = nn.Identity()
-    
-    # Create DCLP networks
-    actor_kwargs = {
-        "n_obs": n_obs,
-        "n_act": n_act,
-        "num_envs": args.num_envs,
-        "device": device,
-        "init_scale": args.init_scale,
-        "hidden_dim": args.actor_hidden_dim,
-    }
-    
-    critic_kwargs = {
-        "n_obs": n_critic_obs,
-        "n_act": n_act,
-        "num_atoms": 101,  # Fixed for distributional critic
-        "v_min": -10.0,
-        "v_max": 10.0,
-        "hidden_dim": args.critic_hidden_dim,
-        "device": device,
-    }
-    
+
     print("Creating DCLP network...")
     # Create single DCLP instance that contains both actor and critic
     dclp = DCLP(
@@ -276,13 +256,10 @@ def main():
         hidden_sizes=(args.actor_hidden_dim, args.actor_hidden_dim, args.actor_hidden_dim, args.actor_hidden_dim),
         device=device
     )
-    
+
     print("DCLP network initialized successfully")
-    
-    # Optimizers are already initialized within the DCLP class
-    
     print("Optimizers and schedulers initialized successfully")
-    
+
     # Replay buffer
     rb = SimpleReplayBuffer(
         n_env=args.num_envs,
@@ -333,39 +310,26 @@ def main():
 
 
                     obs, reward, done, info = envs.step(actions.float())
-                    reward_value = reward[0].item()
-                    if np.isnan(reward_value) or np.isinf(reward_value):
-
-
-
-                        print(f"Warning: Invalid reward {reward_value} at step {episode_length}, setting to 0")
-
-
-
-                        reward_value = 0.0
-                    episode_return += reward_value
+                    episode_return += reward.mean().item()
                     episode_length += 1
                     # Update step progress bar with current reward
                     step_pbar.set_postfix({
-                        'Return': f'{episode_return:.2f}', 
-                        'Reward': f'{reward_value:.3f}',
+                        'Return': f'{episode_return:.2f}',
+                        'Reward': f'{reward.mean().item():.3f}',
                         'Length': episode_length,
                         'Done': done.sum().item()
                     })
                     if done[0]:
                         print(f"Episode {eval_ep+1} finished at step {episode_length} (done=True)")
                         break
-                    # Early stopping if episode gets too long without progress
                     if episode_length >= max_eval_steps:
                         print(f"Episode {eval_ep+1} truncated at {max_eval_steps} steps for faster evaluation")
                         break
-                    # Print progress every 100 steps if episode is long
                     if episode_length % 100 == 0:
-                        print(f"Episode {eval_ep+1}: Step {episode_length}, Return: {episode_return:.2f}, Last Reward: {reward_value:.3f}")
+                        print(f"Episode {eval_ep+1}: Step {episode_length}, Return: {episode_return:.2f}, Last Reward: {reward.mean().item():.3f}")
             step_pbar.close()
             eval_returns.append(episode_return)
             eval_lengths.append(episode_length)
-            # Update episode progress bar
             eval_pbar.set_postfix({
                 'Avg Return': f'{np.mean(eval_returns):.2f}',
                 'Avg Length': f'{np.mean(eval_lengths):.1f}'
@@ -384,22 +348,21 @@ def main():
     
     def update_dclp(data, logs_dict):
         """Update DCLP network (both actor and critic)"""
-        
+
         # Extract data from TensorDict format
         observations = data["observations"].float()  # Convert from float16 to float32
         actions = data["actions"]
         rewards = data["next"]["rewards"]
         next_observations = data["next"]["observations"].float()  # Convert from float16 to float32
         dones = data["next"]["dones"].bool()
-        
-        # Apply normalization if needed
+
         if args.obs_normalization:
             normalized_obs = obs_normalizer(observations, update=True)
             normalized_next_obs = obs_normalizer(next_observations, update=False)
         else:
             normalized_obs = observations
             normalized_next_obs = next_observations
-        
+
         # Prepare batch data for DCLP
         batch = {
             'state': normalized_obs.cpu().numpy(),
@@ -408,13 +371,13 @@ def main():
             'next_state': normalized_next_obs.cpu().numpy(),
             'done': dones.cpu().numpy()
         }
-        
+
         # Train DCLP
         train_metrics = dclp.train_step(batch)
-        
+
         # Log metrics
         logs_dict.update(train_metrics)
-    
+
     # Training loop
     global_step = 0
     obs = envs.reset(random_start_init=False)
@@ -464,9 +427,7 @@ def main():
             for _ in range(args.num_updates):
                 data = rb.sample(args.batch_size)
                 logs_dict = {}
-                # Update DCLP (both actor and critic)
                 update_dclp(data, logs_dict)
-                # Log training metrics
                 if args.use_wandb and len(logs_dict) > 0:
                     logs_dict["train/global_step"] = global_step
                     wandb.log(logs_dict)
@@ -484,8 +445,8 @@ def main():
             elapsed_time = time.time() - start_time
             steps_per_sec = global_step / elapsed_time if elapsed_time > 0 else 0
             pbar.set_description(
-                f"Step: {global_step}, FPS: {steps_per_sec:.0f}, "
-                f"Buffer: {rb.ptr}/{rb.size}"
+                f"step: {global_step},"
+                f"\nbuffer: {rb.ptr}/{rb.size}"
             )
         pbar.update(args.num_envs)
     # Final evaluation and save

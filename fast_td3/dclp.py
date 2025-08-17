@@ -319,17 +319,17 @@ class DCLP:
         rewards = torch.FloatTensor(batch['reward']).to(self.device)
         next_states = torch.FloatTensor(batch['next_state']).to(self.device)
         dones = torch.BoolTensor(batch['done']).to(self.device)
-        
+
         # ============= Critic Update =============
         with torch.no_grad():
             # Target actions from target policy
             _, next_actions, next_log_probs = self.target_actor_critic.policy_network(next_states)
-            
+
             # Apply squashing and get target Q-values
             _, next_actions_squashed, next_log_probs_adjusted = apply_squashing_func(
                 next_actions, next_actions, next_log_probs
             )
-            
+
             # Get target Q-values
             target_features = self.target_actor_critic.shared_cnn_dense(next_states)
             target_q1 = self.target_actor_critic.q_network_1(
@@ -338,11 +338,11 @@ class DCLP:
             target_q2 = self.target_actor_critic.q_network_2(
                 torch.cat([target_features, next_actions_squashed], dim=-1)
             ).squeeze(-1)
-            
+
             # Take minimum and subtract entropy term
             target_q = torch.min(target_q1, target_q2) - self.alpha * next_log_probs_adjusted
             target_q = rewards + (~dones) * self.gamma * target_q
-            
+
         # Current Q-values
         current_features = self.actor_critic.shared_cnn_dense(states)
         current_q1 = self.actor_critic.q_network_1(
@@ -351,22 +351,22 @@ class DCLP:
         current_q2 = self.actor_critic.q_network_2(
             torch.cat([current_features, actions], dim=-1)
         ).squeeze(-1)
-        
+
         # Critic loss
         critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
-        
+
         # Update critic
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
-        
+
         # ============= Actor Update =============
         # Get current policy actions and Q-values
         _, policy_actions, log_probs = self.actor_critic.policy_network(states)
         _, policy_actions_squashed, log_probs_adjusted = apply_squashing_func(
             policy_actions, policy_actions, log_probs
         )
-        
+
         # Q-values for policy actions
         policy_q1 = self.actor_critic.q_network_1(
             torch.cat([current_features.detach(), policy_actions_squashed], dim=-1)
@@ -374,20 +374,20 @@ class DCLP:
         policy_q2 = self.actor_critic.q_network_2(
             torch.cat([current_features.detach(), policy_actions_squashed], dim=-1)
         ).squeeze(-1)
-        
+
         policy_q = torch.min(policy_q1, policy_q2)
-        
+
         # Actor loss (negative because we want to maximize Q)
         actor_loss = (self.alpha * log_probs_adjusted - policy_q).mean()
-        
+
         # Update actor
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
-        
+
         # Update target network
         self.update_target_network()
-        
+
         return {
             'actor_loss': actor_loss.item(),
             'critic_loss': critic_loss.item(),
@@ -395,7 +395,7 @@ class DCLP:
             'q2_mean': current_q2.mean().item(),
             'target_q_mean': target_q.mean().item()
         }
-        
+
     def save(self, filepath):
         """Save model parameters"""
         torch.save({
@@ -404,7 +404,7 @@ class DCLP:
             'actor_optimizer': self.actor_optimizer.state_dict(),
             'critic_optimizer': self.critic_optimizer.state_dict(),
         }, filepath)
-        
+
     def load(self, filepath):
         """Load model parameters"""
         checkpoint = torch.load(filepath, map_location=self.device)
