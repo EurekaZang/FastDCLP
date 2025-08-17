@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from dataclasses import dataclass
+from typing import Optional
 
 EPS = 1e-8
 LOG_STD_MAX = 2
@@ -9,28 +11,28 @@ LOG_STD_MIN = -20
 
 def count_vars(pytorch_model):
     """
-    Counts the total number of trainable parameters in a given PyTorch model.
+    统计给定 PyTorch 模型中所有可训练参数的总数。
 
-    Args:
-        pytorch_model (torch.nn.Module): The PyTorch model whose parameters are to be counted.
+    参数：
+        pytorch_model (torch.nn.Module): 需要统计参数数量的 PyTorch 模型。
 
-    Returns:
-        int: The total number of trainable parameters in the model.
+    返回：
+        int: 模型中所有可训练参数的总数。
     """
 
     return sum(param.numel() for param in pytorch_model.parameters() if param.requires_grad)
 
 def clip_with_gradient_passthrough(input_tensor, lower_bound=-1., upper_bound=1.):
     """
-    Clips the values of the input tensor to the specified lower and upper bounds during the forward pass,
-    but allows gradients to pass through as if no clipping was applied during the backward pass.
-    Args:
-        input_tensor (torch.Tensor): The input tensor to be clipped.
-        lower_bound (float, optional): The lower bound to clip to. Default is -1.0.
-        upper_bound (float, optional): The upper bound to clip to. Default is 1.0.
-    Returns:
-        torch.Tensor: The tensor with values clipped to the specified bounds in the forward pass,
-                      but with gradients unaffected by the clipping operation.
+    在前向传播时将输入张量的值裁剪到指定的上下界，
+    但在反向传播时允许梯度像未裁剪一样通过。
+    参数：
+        input_tensor (torch.Tensor): 需要裁剪的输入张量。
+        lower_bound (float, 可选): 裁剪的下界，默认-1.0。
+        upper_bound (float, 可选): 裁剪的上界，默认1.0。
+    返回：
+        torch.Tensor: 前向传播时被裁剪到指定范围的张量，
+                      但梯度不受裁剪影响。
     """
 
     clip_upper_mask = (input_tensor > upper_bound).float()
@@ -39,18 +41,18 @@ def clip_with_gradient_passthrough(input_tensor, lower_bound=-1., upper_bound=1.
 
 def clip_min_with_gradient_passthrough(input_tensor, lower_bound=EPS):
     """
-    Clips the values of the input tensor below a specified lower bound, but allows gradients to pass through as if no clipping occurred.
+    将输入张量中小于指定下界的值裁剪到下界，
+    但在反向传播时允许梯度像未裁剪一样通过。
 
-    This function sets all elements of `input_tensor` that are less than `lower_bound` to `lower_bound` in the forward pass, 
-    while preserving the original gradients during backpropagation. This is useful in scenarios where you want to enforce 
-    a minimum value constraint during inference but do not want the clipping operation to affect gradient computation.
+    该函数在前向传播时将所有小于 lower_bound 的元素设为 lower_bound，
+    但在反向传播时保留原始梯度。适用于推理时需要最小值约束但不希望影响梯度计算的场景。
 
-    Args:
-        input_tensor (torch.Tensor): The input tensor to be clipped.
-        lower_bound (float, optional): The minimum value to clip to. Defaults to EPS.
+    参数：
+        input_tensor (torch.Tensor): 需要裁剪的输入张量。
+        lower_bound (float, 可选): 最小裁剪值，默认为 EPS。
 
-    Returns:
-        torch.Tensor: The tensor with values clipped below `lower_bound`, but with gradients unaffected by the clipping.
+    返回：
+        torch.Tensor: 小于 lower_bound 的值被裁剪，但梯度不受影响的张量。
     """
 
     clip_low_mask = (input_tensor < lower_bound).float()
@@ -59,16 +61,16 @@ def clip_min_with_gradient_passthrough(input_tensor, lower_bound=EPS):
 
 def reciprocal_relu(input_features, alpha_activation):
     """
-    Applies a reciprocal ReLU-like activation function to the input tensor.
+    对输入张量应用类似于 ReLU 的倒数激活函数。
 
-    This function computes the reciprocal of the input tensor added to an alpha activation parameter,
-    after applying a custom clipping function (`clip_min_with_gradient_passthrough`) with a lower bound of EPS.
-    The gradient is preserved through the clipping operation.
-    Args:
-        input_features (torch.Tensor): The input tensor to apply the activation function to.
-        alpha_activation (float or torch.Tensor): The alpha parameter to be added to the input tensor before activation.
-    Returns:
-        torch.Tensor: The result of applying the modified activation function.
+    该函数先对输入加上 alpha_activation 参数后，
+    用自定义裁剪函数（clip_min_with_gradient_passthrough，最小值为 EPS）处理，
+    然后取倒数。梯度在裁剪操作中被保留。
+    参数：
+        input_features (torch.Tensor): 需要激活的输入张量。
+        alpha_activation (float 或 torch.Tensor): 激活前加到输入上的 alpha 参数。
+    返回：
+        torch.Tensor: 应用激活函数后的结果。
     """
 
     # 检查输入是否包含 NaN 或 inf
@@ -86,16 +88,16 @@ def reciprocal_relu(input_features, alpha_activation):
 
 def create_log_gaussian(mean_tensor, log_std_tensor, sample_points):
     """
-    Computes the log-probability of samples under a multivariate diagonal Gaussian distribution.
-    Args:
-        mean_tensor (torch.Tensor): The mean of the Gaussian distribution. Shape: (..., D)
-        log_std_tensor (torch.Tensor): The log standard deviation of the Gaussian distribution. Shape: (..., D)
-        sample_points (torch.Tensor): The points at which to evaluate the log-probability. Shape: (..., D)
-    Returns:
-        torch.Tensor: The log-probabilities of the sample points under the specified Gaussian. Shape: (...,)
-    Notes:
-        - Assumes a diagonal covariance matrix (i.e., independent dimensions).
-        - The function uses the log standard deviation for numerical stability.
+    计算样本在多元对角高斯分布下的对数概率。
+    参数：
+        mean_tensor (torch.Tensor): 高斯分布的均值，形状 (..., D)
+        log_std_tensor (torch.Tensor): 高斯分布的对数标准差，形状 (..., D)
+        sample_points (torch.Tensor): 需要计算对数概率的样本点，形状 (..., D)
+    返回：
+        torch.Tensor: 每个样本点在指定高斯分布下的对数概率，形状 (...,)
+    说明：
+        - 假设协方差矩阵为对角阵（各维独立）。
+        - 使用对数标准差以保证数值稳定性。
     """
 
     # 计算标准化距离
@@ -114,17 +116,16 @@ def create_log_gaussian(mean_tensor, log_std_tensor, sample_points):
 
 def apply_squashing_func(action_mean, sampled_action, log_action_prob):
     """
-    Applies a squashing function (tanh) to the input tensors and adjusts the log-probabilities
-    with the appropriate Jacobian correction.
-    Args:
-        action_mean (torch.Tensor): The mean tensor to be squashed.
-        sampled_action (torch.Tensor): The sampled action tensor to be squashed.
-        log_action_prob (torch.Tensor): The log-probabilities of the actions before squashing.
-    Returns:
+    对输入张量应用压缩函数（tanh），并对动作的对数概率进行雅可比修正。
+    参数：
+        action_mean (torch.Tensor): 需要压缩的均值张量。
+        sampled_action (torch.Tensor): 需要压缩的采样动作张量。
+        log_action_prob (torch.Tensor): 压缩前的动作对数概率。
+    返回：
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            - Squashed mean tensor (action_mean) after applying tanh.
-            - Squashed action tensor (sampled_action) after applying tanh.
-            - Adjusted log-probabilities (log_action_prob) with Jacobian correction for tanh.
+            - 压缩后的均值张量（action_mean，tanh 后）。
+            - 压缩后的动作张量（sampled_action，tanh 后）。
+            - 经雅可比修正后的对数概率（log_action_prob）。
     """
     # 应用tanh压缩
     squashed_mean = torch.tanh(action_mean)
@@ -297,3 +298,118 @@ class MLP(nn.Module):
                 if self.output_activation is not None:
                     output_tensor = self.output_activation(output_tensor)
         return output_tensor
+    
+
+
+@dataclass
+class DCLPArgs:
+    """DCLP training arguments"""
+    # Environment
+    env_name: str = "Isaac-Navigation-Flat-Turtlebot2-v0"
+    """IsaacLab environment name"""
+
+    # Training
+    seed: int = 1
+    """Random seed"""
+    total_timesteps: int = 1000000
+    """Total training timesteps"""
+    learning_starts: int = 25000
+    """Steps before learning starts"""
+    num_envs: int = 1024
+    """Number of parallel environments"""
+
+    # Algorithm
+    agent: str = "dclp_td3"
+    """Agent type"""
+    gamma: float = 0.99
+    """Discount factor"""
+    tau: float = 0.005
+    """Target network soft update rate"""
+    batch_size: int = 4096
+    """Training batch size"""
+    buffer_size: int = 1024 * 5
+    """Replay buffer size"""
+
+    # Learning rates
+    actor_learning_rate: float = 3e-4
+    """Actor learning rate"""
+    critic_learning_rate: float = 3e-4
+    """Critic learning rate"""
+    actor_learning_rate_end: float = 3e-5
+    """Actor final learning rate"""
+    critic_learning_rate_end: float = 3e-5
+    """Critic final learning rate"""
+
+    # Network architecture
+    actor_hidden_dim: int = 512
+    """Actor hidden dimension"""
+    critic_hidden_dim: int = 1024
+    """Critic hidden dimension"""
+    init_scale: float = 0.01
+    """Actor initialization scale"""
+
+    # TD3 specific
+    policy_noise: float = 0.1
+    """Policy noise for target smoothing"""
+    noise_clip: float = 0.5
+    """Noise clipping for target smoothing"""
+    policy_frequency: int = 2
+    """Policy update frequency"""
+    num_updates: int = 1
+    """Number of updates per step"""
+
+    # Normalization
+    obs_normalization: bool = True
+    """Use observation normalization"""
+    reward_normalization: bool = False
+    """Use reward normalization"""
+
+    # Hardware
+    cuda: bool = True
+    """Use CUDA if available"""
+    device_rank: int = 0
+    """Device rank"""
+    torch_deterministic: bool = True
+    """PyTorch deterministic mode"""
+
+    # Optimization
+    amp: bool = True
+    """Use automatic mixed precision"""
+    amp_dtype: str = "fp16"
+    """AMP dtype (bf16 or fp16)"""
+    compile: bool = True
+    """Compile model with torch.compile"""
+    compile_mode: str = "reduce-overhead"
+    """Compile mode"""
+    weight_decay: float = 0.0
+    """Weight decay"""
+    use_grad_norm_clipping: bool = False
+    """Use gradient norm clipping"""
+    max_grad_norm: float = 0.5
+    """Maximum gradient norm"""
+
+    # Logging
+    use_wandb: bool = True
+    """Use Weights & Biases logging"""
+    project: str = "DCLP-IsaacLab"
+    """W&B project name"""
+    exp_name: str = "dclp_training"
+    """Experiment name"""
+    eval_interval: int = 10000
+    """Evaluation interval"""
+    save_interval: int = 50000
+    """Model save interval"""
+
+    # Environment specific
+    action_bounds: float = 1.0
+    """Action bounds scaling"""
+    max_episode_steps: Optional[int] = None
+    """Maximum episode steps override"""
+
+    # DCLP specific
+    lidar_points: int = 90
+    """Number of LiDAR points (270/3)"""
+    lidar_features: int = 3
+    """LiDAR features per point (sin, cos, distance)"""
+    use_cnn_features: bool = True
+    """Use CNN for LiDAR feature extraction"""

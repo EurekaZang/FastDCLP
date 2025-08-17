@@ -51,122 +51,9 @@ from fast_td3_utils import (
 )
 from environments.isaaclab_env import IsaacLabEnv
 from dclp import DCLP, MLPActorCritic
+from dclp_utils import DCLPArgs
 
 torch.set_float32_matmul_precision("high")
-
-
-@dataclass
-class DCLPArgs:
-    """DCLP training arguments"""
-    # Environment
-    env_name: str = "Isaac-Navigation-Flat-Turtlebot2-v0"
-    """IsaacLab environment name"""
-    
-    # Training
-    seed: int = 1
-    """Random seed"""
-    total_timesteps: int = 1000000
-    """Total training timesteps"""
-    learning_starts: int = 25000
-    """Steps before learning starts"""
-    num_envs: int = 1024
-    """Number of parallel environments"""
-    
-    # Algorithm
-    agent: str = "dclp_td3"
-    """Agent type"""
-    gamma: float = 0.99
-    """Discount factor"""
-    tau: float = 0.005
-    """Target network soft update rate"""
-    batch_size: int = 4096
-    """Training batch size"""
-    buffer_size: int = 1024 * 5
-    """Replay buffer size"""
-    
-    # Learning rates
-    actor_learning_rate: float = 3e-4
-    """Actor learning rate"""
-    critic_learning_rate: float = 3e-4
-    """Critic learning rate"""
-    actor_learning_rate_end: float = 3e-5
-    """Actor final learning rate"""
-    critic_learning_rate_end: float = 3e-5
-    """Critic final learning rate"""
-    
-    # Network architecture
-    actor_hidden_dim: int = 512
-    """Actor hidden dimension"""
-    critic_hidden_dim: int = 1024
-    """Critic hidden dimension"""
-    init_scale: float = 0.01
-    """Actor initialization scale"""
-    
-    # TD3 specific
-    policy_noise: float = 0.1
-    """Policy noise for target smoothing"""
-    noise_clip: float = 0.5
-    """Noise clipping for target smoothing"""
-    policy_frequency: int = 2
-    """Policy update frequency"""
-    num_updates: int = 1
-    """Number of updates per step"""
-    
-    # Normalization
-    obs_normalization: bool = True
-    """Use observation normalization"""
-    reward_normalization: bool = False
-    """Use reward normalization"""
-    
-    # Hardware
-    cuda: bool = True
-    """Use CUDA if available"""
-    device_rank: int = 0
-    """Device rank"""
-    torch_deterministic: bool = True
-    """PyTorch deterministic mode"""
-    
-    # Optimization
-    amp: bool = True
-    """Use automatic mixed precision"""
-    amp_dtype: str = "fp16"
-    """AMP dtype (bf16 or fp16)"""
-    compile: bool = True
-    """Compile model with torch.compile"""
-    compile_mode: str = "reduce-overhead"
-    """Compile mode"""
-    weight_decay: float = 0.0
-    """Weight decay"""
-    use_grad_norm_clipping: bool = False
-    """Use gradient norm clipping"""
-    max_grad_norm: float = 0.5
-    """Maximum gradient norm"""
-    
-    # Logging
-    use_wandb: bool = True
-    """Use Weights & Biases logging"""
-    project: str = "DCLP-IsaacLab"
-    """W&B project name"""
-    exp_name: str = "dclp_training"
-    """Experiment name"""
-    eval_interval: int = 10000
-    """Evaluation interval"""
-    save_interval: int = 50000
-    """Model save interval"""
-    
-    # Environment specific
-    action_bounds: float = 1.0
-    """Action bounds scaling"""
-    max_episode_steps: Optional[int] = None
-    """Maximum episode steps override"""
-    
-    # DCLP specific
-    lidar_points: int = 90
-    """Number of LiDAR points (270/3)"""
-    lidar_features: int = 3
-    """LiDAR features per point (sin, cos, distance)"""
-    use_cnn_features: bool = True
-    """Use CNN for LiDAR feature extraction"""
 
 
 def main():
@@ -446,7 +333,7 @@ def main():
             steps_per_sec = global_step / elapsed_time if elapsed_time > 0 else 0
             pbar.set_description(
                 f"step: {global_step},"
-                f"\nbuffer: {rb.ptr}/{rb.size}"
+                f"buffer: {rb.ptr}/{rb.size}"
             )
         pbar.update(args.num_envs)
     # Final evaluation and save
