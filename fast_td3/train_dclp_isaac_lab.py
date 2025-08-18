@@ -25,6 +25,8 @@ import torch.nn.functional as F
 import tqdm
 import wandb
 import tyro
+import gc
+import psutil
 
 # Environment setup
 os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
@@ -108,7 +110,8 @@ def main():
         num_envs=args.num_envs,
         seed=args.seed,
         action_bounds=args.action_bounds,
-        headless=True,  # Always headless for training
+        render_mode="human",
+        headless=True,
     )
     
     # Get environment dimensions
@@ -189,13 +192,6 @@ def main():
                         device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
                     ):
                         actions = dclp.get_action(norm_obs)
-
-
-
-                    print(f"logging from train_dclp_isaac_lab.py, in def evaluate(), action: {actions}")
-
-
-
                     obs, reward, done, info = envs.step(actions.float())
                     episode_return += reward.mean().item()
                     episode_length += 1
@@ -212,7 +208,7 @@ def main():
                     if episode_length >= max_eval_steps:
                         print(f"Episode {evaluate_episode+1} truncated at {max_eval_steps} steps for faster evaluation")
                         break
-                    if episode_length % 100 == 0:
+                    if episode_length % 1000 == 0:
                         print(f"Episode {evaluate_episode+1}: Step {episode_length}, Return: {episode_return:.2f}, Last Reward: {reward.mean().item():.3f}")
             step_pbar.close()
             eval_returns.append(episode_return)
@@ -262,13 +258,51 @@ def main():
         # Train DCLP
         train_metrics = dclp.train_step(batch)
 
+        # Calculate total episode reward
+        total_episode_reward = rewards.sum().item()
+
+        # Log total episode reward to W&B
+        if args.use_wandb:
+            logs_dict["total_episode_reward"] = total_episode_reward
+
         # Log metrics
         logs_dict.update(train_metrics)
+
+    # Log hyperparameters to W&B
+    if args.use_wandb:
+        wandb.config.update({
+            "actor_learning_rate": args.actor_learning_rate,
+            "critic_learning_rate": args.critic_learning_rate,
+            "gamma": args.gamma,
+            "tau": args.tau,
+            "batch_size": args.batch_size,
+            "buffer_size": args.buffer_size,
+            "num_envs": args.num_envs,
+            "total_timesteps": args.total_timesteps,
+            "eval_interval": args.eval_interval,
+            "save_interval": args.save_interval,
+        })
+
+    # Log system metrics to W&B
+    if args.use_wandb:
+        wandb.log({
+            "system/gpu_memory_allocated": torch.cuda.memory_allocated(device) if torch.cuda.is_available() else 0,
+            "system/gpu_memory_reserved": torch.cuda.memory_reserved(device) if torch.cuda.is_available() else 0,
+            "system/cpu_memory_usage": psutil.virtual_memory().percent,
+        })
+
+    # Log training metrics to W&B
+    if args.use_wandb:
+        wandb.log({
+            "train/actor_loss": 0,
+            "train/critic_loss": 0,
+            "train/learning_rate": args.actor_learning_rate,
+            "train/grad_norm": 0,
+        })
 
     # Training loop
     global_step = 0
     obs = envs.reset(random_start_init=False)
-    print(f"\n\n\n\n\n\n\n\nInitial observation shape: {obs.shape}")
     dones = torch.zeros(args.num_envs, dtype=torch.bool, device=device)
     pbar = tqdm.tqdm(total=args.total_timesteps, initial=global_step)
     start_time = time.time()
@@ -285,8 +319,10 @@ def main():
                 with torch.no_grad(), autocast(
                     device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
                 ):
+                    # print("norm_obs stats:", norm_obs.min().item(), norm_obs.max().item(), torch.isnan(norm_obs).any().item(), torch.isinf(norm_obs).any().item())
                     actions = dclp.get_action(norm_obs)
         next_obs, rewards, next_dones, infos = envs.step(actions.float())
+        # print("next_obs stats:", next_obs.min().item(), next_obs.max().item(), torch.isnan(next_obs).any().item(), torch.isinf(next_obs).any().item())
         if hasattr(reward_normalizer, 'update_stats'):
             reward_normalizer.update_stats(rewards, next_dones)
         normalized_rewards = reward_normalizer(rewards) # If --reward-normalization = False, this is identity
@@ -308,6 +344,7 @@ def main():
             obs_normalizer(obs)
             critic_obs_normalizer(obs)
         obs = next_obs
+        # print("obs stats:", obs.min().item(), obs.max().item(), torch.isnan(obs).any().item(), torch.isinf(obs).any().item())
         dones = next_dones
         global_step += args.num_envs
         # Training updates
@@ -318,23 +355,31 @@ def main():
                 update_dclp(data, logs_dict)
                 if args.use_wandb and len(logs_dict) > 0:
                     logs_dict["train/global_step"] = global_step
+                    logs_dict["rewards"] = data["next"]["rewards"].mean().item()
                     wandb.log(logs_dict)
         # Periodic evaluation
-        if global_step % args.eval_interval == 0 and global_step > 0:
+        if global_step % (args.eval_interval * args.num_envs) == 0 and global_step > 0:
             evaluate()
         # Periodic model saving
         if global_step % args.save_interval == 0 and global_step > 0:
             os.makedirs("models", exist_ok=True)
-            save_path = f"models/{run_name}_{global_step}.pt"
+            save_path = f"../models/{run_name}_{global_step}.pt"
             dclp.save(save_path)
             print(f"Model saved to {save_path}")
+            # Log model checkpoint to W&B
+            if args.use_wandb:
+                artifact = wandb.Artifact(run_name, type="model")
+                artifact.add_file(save_path)
+                wandb.log_artifact(artifact)
         # Update progress bar
-        if global_step % 1000 == 0:
+        rewards = rewards.mean(dim=-1).item()
+        if global_step % (100 * args.num_envs) == 0:
             elapsed_time = time.time() - start_time
             steps_per_sec = global_step / elapsed_time if elapsed_time > 0 else 0
             pbar.set_description(
                 f"step: {global_step},"
-                f"buffer: {rb.ptr}/{rb.size}"
+                f"buffer: {rb.ptr}/{rb.size},"
+                f"reward: {rewards:.4f},"
             )
         pbar.update(args.num_envs)
     # Final evaluation and save
@@ -350,5 +395,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
     main()

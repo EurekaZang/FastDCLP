@@ -311,7 +311,7 @@ class DCLPArgs:
     # Training
     seed: int = 1
     """Random seed"""
-    total_timesteps: int = 1000000
+    total_timesteps: int = 2000000
     """Total training timesteps"""
     learning_starts: int = 25000
     """Steps before learning starts"""
@@ -319,7 +319,7 @@ class DCLPArgs:
     """Number of parallel environments"""
 
     # Algorithm
-    agent: str = "dclp_td3"
+    agent: str = "dclp"
     """Agent type"""
     gamma: float = 0.99
     """Discount factor"""
@@ -341,9 +341,9 @@ class DCLPArgs:
     """Critic final learning rate"""
 
     # Network architecture
-    actor_hidden_dim: int = 512
+    actor_hidden_dim: int = 128
     """Actor hidden dimension"""
-    critic_hidden_dim: int = 1024
+    critic_hidden_dim: int = 128
     """Critic hidden dimension"""
     init_scale: float = 0.01
     """Actor initialization scale"""
@@ -359,7 +359,7 @@ class DCLPArgs:
     """Number of updates per step"""
 
     # Normalization
-    obs_normalization: bool = True
+    obs_normalization: bool = False
     """Use observation normalization"""
     reward_normalization: bool = False
     """Use reward normalization"""
@@ -395,13 +395,13 @@ class DCLPArgs:
     """W&B project name"""
     exp_name: str = "dclp_training"
     """Experiment name"""
-    eval_interval: int = 10000
+    eval_interval: int = 100000
     """Evaluation interval"""
-    save_interval: int = 50000
+    save_interval: int = 100000
     """Model save interval"""
 
     # Environment specific
-    action_bounds: float = 1.0
+    action_bounds: float = None
     """Action bounds scaling"""
     max_episode_steps: Optional[int] = None
     """Maximum episode steps override"""
