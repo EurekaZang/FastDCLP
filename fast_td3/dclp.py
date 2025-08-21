@@ -248,7 +248,7 @@ class DCLP:
         self.device = device
         self.actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
         self.target_actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
-        self.update_target_network(tau=1.0)
+        self.update_target_network(tau=self.tau)
         self.actor_optimizer = torch.optim.Adam(self.actor_critic.policy_network.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(
             list(self.actor_critic.shared_cnn_dense.parameters()) +
@@ -263,11 +263,11 @@ class DCLP:
                 # Use mean action for deterministic policy
                 action_mean, _, _ = self.actor_critic.policy_network(state)
                 # action = torch.tanh(action_mean)
-                return action_mean * 10
+                return action_mean
             else:
                 # Sample action from policy
                 _, sampled_action, _ = self.actor_critic.policy_network(state)
-                return sampled_action * 10
+                return sampled_action
 
     def update_target_network(self, tau=None):
         """Soft update of target network parameters"""
@@ -355,7 +355,7 @@ class DCLP:
         self.actor_optimizer.step()
 
         # Update target network
-        self.update_target_network()
+        self.update_target_network(tau=self.tau)
 
         return {
             'actor_loss': actor_loss.item(),
