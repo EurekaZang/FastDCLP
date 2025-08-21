@@ -53,7 +53,7 @@ from fast_td3_utils import (
 )
 from environments.isaaclab_env import IsaacLabEnv
 from dclp import DCLP, MLPActorCritic
-from dclp_utils import DCLPArgs
+from dclp_utils import DCLPArgs, calculate_turtlebot_velocities
 
 torch.set_float32_matmul_precision("high")
 
@@ -61,19 +61,19 @@ torch.set_float32_matmul_precision("high")
 def main():
     args = tyro.cli(DCLPArgs)
     print(f"Training DCLP with args: {args}")
-    
+
     run_name = f"{args.env_name}__{args.exp_name}__{args.seed}"
-    
+
     # Setup mixed precision
     amp_enabled = args.amp and args.cuda and torch.cuda.is_available()
     amp_device_type = (
         "cuda" if args.cuda and torch.cuda.is_available()
-        else "mps" if args.cuda and torch.backends.mps.is_available() 
+        else "mps" if args.cuda and torch.backends.mps.is_available()
         else "cpu"
     )
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     scaler = GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
-    
+
     # Initialize W&B
     if args.use_wandb:
         wandb.init(
@@ -82,13 +82,12 @@ def main():
             config=vars(args),
             save_code=True,
         )
-    
     # Set seeds
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
-    
+
     # Setup device
     if not args.cuda:
         device = torch.device("cpu")
@@ -99,9 +98,9 @@ def main():
             device = torch.device("mps")
         else:
             device = torch.device("cpu")
-    
+
     print(f"Using device: {device}")
-    
+
     # Create IsaacLab environment
     print(f"Creating IsaacLab environment: {args.env_name}")
     envs = IsaacLabEnv(
@@ -113,14 +112,14 @@ def main():
         render_mode="human",
         headless=True,
     )
-    
+
     # Get environment dimensions
     n_obs = envs.num_obs
     n_act = envs.num_actions
     n_critic_obs = n_obs  # DCLP uses same obs for critic
-    
+
     print(f"Environment specs - Obs: {n_obs}, Actions: {n_act}, Envs: {args.num_envs}")
-    
+
     # Setup normalization
     if args.obs_normalization:
         obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
@@ -139,10 +138,11 @@ def main():
     dclp = DCLP(
         state_dim=n_obs,
         action_dim=n_act,
-        lr=args.actor_learning_rate,
+        actor_lr=args.actor_learning_rate,
+        critic_lr=args.critic_learning_rate,
         gamma=args.gamma,
         tau=args.tau,
-        alpha=0.2,  # Entropy coefficient
+        alpha=args.alpha,
         hidden_sizes=(args.actor_hidden_dim, args.actor_hidden_dim, args.actor_hidden_dim, args.actor_hidden_dim),
         device=device
     )
@@ -319,10 +319,14 @@ def main():
                 with torch.no_grad(), autocast(
                     device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
                 ):
-                    # print("norm_obs stats:", norm_obs.min().item(), norm_obs.max().item(), torch.isnan(norm_obs).any().item(), torch.isinf(norm_obs).any().item())
                     actions = dclp.get_action(norm_obs)
+                    wandb.log({
+                        "env1_left_wheel_action": actions[0][0],
+                        "env1_right_wheel_action": actions[0][1],
+                        "linear velocity": calculate_turtlebot_velocities(actions[0][0], actions[0][1])[0],
+                        "angular velocity": calculate_turtlebot_velocities(actions[0][0], actions[0][1])[1],
+                    })
         next_obs, rewards, next_dones, infos = envs.step(actions.float())
-        # print("next_obs stats:", next_obs.min().item(), next_obs.max().item(), torch.isnan(next_obs).any().item(), torch.isinf(next_obs).any().item())
         if hasattr(reward_normalizer, 'update_stats'):
             reward_normalizer.update_stats(rewards, next_dones)
         normalized_rewards = reward_normalizer(rewards) # If --reward-normalization = False, this is identity
@@ -344,7 +348,6 @@ def main():
             obs_normalizer(obs)
             critic_obs_normalizer(obs)
         obs = next_obs
-        # print("obs stats:", obs.min().item(), obs.max().item(), torch.isnan(obs).any().item(), torch.isinf(obs).any().item())
         dones = next_dones
         global_step += args.num_envs
         # Training updates

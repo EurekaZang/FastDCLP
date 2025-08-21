@@ -169,7 +169,7 @@ class CNNDense(nn.Module):
         super(CNNDense, self).__init__()
         # 定义可训练激活参数
         self.alpha_activation_param = nn.Parameter(torch.tensor(0.0), requires_grad=True)
-        self.conv_layer_1 = nn.Conv1d(6, 32, kernel_size=1, stride=1, padding=0)
+        self.conv_layer_1 = nn.Conv1d(3, 32, kernel_size=1, stride=1, padding=0)
         self.conv_layer_2 = nn.Conv1d(32, 64, kernel_size=1, stride=1, padding=0)
         self.conv_layer_3 = nn.Conv1d(64, 128, kernel_size=1, stride=1, padding=0)
         self.max_pool = nn.MaxPool1d(kernel_size=90, stride=1, padding=0)
@@ -261,19 +261,15 @@ class MLP(nn.Module):
         hidden_sizes (list or tuple of int): Sizes of the hidden layers.
         activation (callable, optional): Activation function to use for hidden layers. Defaults to F.leaky_relu.
         output_activation (callable, optional): Activation function to use for the output layer. Defaults to None.
-
     Attributes:
         hidden_activation (callable): Activation function for hidden layers.
         output_activation (callable): Activation function for the output layer.
         layer_modules (nn.ModuleList): List of linear layers in the network.
-
     Methods:
         forward(input_tensor):
             Performs a forward pass through the network.
-
             Args:
                 input_tensor (torch.Tensor): Input tensor to the network.
-
             Returns:
                 torch.Tensor: Output tensor after passing through the MLP.
     """
@@ -298,8 +294,34 @@ class MLP(nn.Module):
                 if self.output_activation is not None:
                     output_tensor = self.output_activation(output_tensor)
         return output_tensor
-    
 
+def calculate_turtlebot_velocities(omega_left_rad_s, omega_right_rad_s):
+    """
+    根据左右轮角速度计算TurtleBot2的线速度和角速度。
+
+    Args:
+        omega_left_rad_s (float): 左轮角速度 (弧度/秒).
+        omega_right_rad_s (float): 右轮角速度 (弧度/秒).
+
+    Returns:
+        tuple: 包含线速度 (米/秒) 和角速度 (弧度/秒) 的元组.
+    """
+    # TurtleBot2 的尺寸参数 (使用您提供的数据)
+    wheel_diameter_mm = 72.0
+    wheelbase_mm = 235.0
+
+    # 将单位转换为米
+    wheel_radius_m = (wheel_diameter_mm / 2.0) / 1000.0  # 72mm / 2 = 36mm = 0.036 m
+    wheelbase_m = wheelbase_mm / 1000.0             # 235mm = 0.235 m
+
+    # 计算 TurtleBot2 的线速度
+    linear_velocity_m_s = wheel_radius_m * (omega_left_rad_s + omega_right_rad_s) / 2.0
+
+    # 计算 TurtleBot2 的角速度
+    # 注意：这里右轮减左轮是通常的约定，会产生正角速度（逆时针旋转）
+    angular_velocity_rad_s = wheel_radius_m * (omega_right_rad_s - omega_left_rad_s) / wheelbase_m
+
+    return linear_velocity_m_s, angular_velocity_rad_s
 
 @dataclass
 class DCLPArgs:
@@ -309,7 +331,7 @@ class DCLPArgs:
     """IsaacLab environment name"""
 
     # Training
-    seed: int = 1
+    seed: int = 42
     """Random seed"""
     total_timesteps: int = 2000000
     """Total training timesteps"""
@@ -329,15 +351,17 @@ class DCLPArgs:
     """Training batch size"""
     buffer_size: int = 1024 * 5
     """Replay buffer size"""
+    alpha: float = 0.01
+    """Entropy regularization coefficient"""
 
     # Learning rates
-    actor_learning_rate: float = 3e-4
+    actor_learning_rate: float = 1e-4
     """Actor learning rate"""
-    critic_learning_rate: float = 3e-4
+    critic_learning_rate: float = 1e-4
     """Critic learning rate"""
-    actor_learning_rate_end: float = 3e-5
+    actor_learning_rate_end: float = 1e-5
     """Actor final learning rate"""
-    critic_learning_rate_end: float = 3e-5
+    critic_learning_rate_end: float = 1e-5
     """Critic final learning rate"""
 
     # Network architecture
@@ -369,7 +393,7 @@ class DCLPArgs:
     """Use CUDA if available"""
     device_rank: int = 0
     """Device rank"""
-    torch_deterministic: bool = True
+    torch_deterministic: bool = False
     """PyTorch deterministic mode"""
 
     # Optimization

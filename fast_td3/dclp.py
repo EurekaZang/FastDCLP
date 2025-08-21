@@ -151,57 +151,25 @@ class MLPActorCritic(nn.Module):
 
         # ============= Critic网络(价值网络) =============
         # 使用自定义的CNN特征提取器(匹配270维LiDAR输入)
-        self.shared_cnn_dense = self._create_cnn_feature_extractor(activation)
+        self.shared_cnn_dense = CNNDense(activation, None)
 
         # Q网络：输入特征+动作，输出Q值
         q_network_input_dim = 128 + 10 + action_dim  # CNN特征 138维 + 动作 2维 = 140维
         self.q_network_1 = MLP(q_network_input_dim, list(hidden_sizes) + [1], activation, None)
         self.q_network_2 = MLP(q_network_input_dim, list(hidden_sizes) + [1], activation, None)
+        
+        # 确保两个Q网络有不同的初始化
+        self._initialize_networks()
 
-    def _create_cnn_feature_extractor(self, activation):
-        """创建与270维LiDAR输入兼容的CNN特征提取器"""
-        class CNN270FeatureExtractor(nn.Module):
-            def __init__(self, activation):
-                super().__init__()
-                self.alpha_activation_param = nn.Parameter(torch.tensor(0.0), requires_grad=True)
-                # 对于270维输入(90个点，每个点3个特征)
-                self.conv_layer_1 = nn.Conv1d(3, 32, kernel_size=1, stride=1, padding=0)
-                self.conv_layer_2 = nn.Conv1d(32, 64, kernel_size=1, stride=1, padding=0)
-                self.conv_layer_3 = nn.Conv1d(64, 128, kernel_size=1, stride=1, padding=0)
-                self.max_pool = nn.MaxPool1d(kernel_size=90, stride=1, padding=0)
-                self.activation_func = activation
-                
-            def forward(self, input_data):
-                # 提取LiDAR数据（前270维）并重塑
-                lidar_data = input_data[:, 0:270]  # [batch, 270]
-                reshaped_lidar = lidar_data.view(-1, 90, 3)  # [batch, 90方向, 3特征]
-                
-                # 处理距离信息(第3个特征) - 使用简单的激活函数替代
-                processed_distance = torch.clamp(1.0 / (reshaped_lidar[:, :, 2] + self.alpha_activation_param + 1e-8), 
-                                                min=1e-6, max=1e6)
-                
-                # 重新组合特征
-                combined_lidar_features = torch.cat([
-                    reshaped_lidar[:, :, 0:2],  # 方向信息
-                    processed_distance.unsqueeze(-1),  # 处理后的距离
-                ], dim=-1)
-                
-                # 转换为Conv1d格式: [batch, features, sequence]
-                transposed_features = combined_lidar_features.transpose(1, 2)
-                
-                # 三层1D卷积提取特征
-                conv1_output = F.leaky_relu(self.conv_layer_1(transposed_features))
-                conv2_output = F.leaky_relu(self.conv_layer_2(conv1_output))
-                conv3_output = F.leaky_relu(self.conv_layer_3(conv2_output))
-                
-                # 全局最大池化
-                pooled_features = self.max_pool(conv3_output)
-                flattened_cnn_features = pooled_features.view(pooled_features.size(0), -1)
-                
-                # 拼接CNN特征和其他状态信息（后10维）
-                return torch.cat([flattened_cnn_features, input_data[:, 270:]], dim=-1)
-                
-        return CNN270FeatureExtractor(activation)
+    def _initialize_networks(self):
+        for layer in self.q_network_1.layer_modules:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.constant_(layer.bias, 0.0)
+        for layer in self.q_network_2.layer_modules:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.constant_(layer.bias, 0.1)
 
     def forward(self, state_input, action_input=None):
         """
@@ -256,15 +224,16 @@ class DCLP:
     This class implements the DCLP training algorithm for reinforcement learning
     with distributional Q-learning and categorical policy networks.
     """
-    
-    def __init__(self, state_dim, action_dim, lr=3e-4, gamma=0.99, tau=0.005, 
+
+    def __init__(self, state_dim, action_dim, actor_lr=1e-4, critic_lr=1e-4, gamma=0.99, tau=0.005,
                  alpha=0.2, hidden_sizes=(128, 128, 128, 128), device='cuda'):
         """
         Initialize DCLP algorithm
         Args:
             state_dim: Dimension of state space
             action_dim: Dimension of action space
-            lr: Learning rate
+            actor_lr: Learning rate for actor
+            critic_lr: Learning rate for critic
             gamma: Discount factor
             tau: Soft update parameter
             alpha: Temperature parameter for entropy regularization
@@ -280,30 +249,31 @@ class DCLP:
         self.actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
         self.target_actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
         self.update_target_network(tau=1.0)
-        self.actor_optimizer = torch.optim.Adam(self.actor_critic.policy_network.parameters(), lr=lr)
+        self.actor_optimizer = torch.optim.Adam(self.actor_critic.policy_network.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(
             list(self.actor_critic.shared_cnn_dense.parameters()) +
             list(self.actor_critic.q_network_1.parameters()) +
-            list(self.actor_critic.q_network_2.parameters()), lr=lr
+            list(self.actor_critic.q_network_2.parameters()), lr=critic_lr
         )
 
-    def get_action(self, state, deterministic=False):
+    def get_action(self, state, deterministic=True):
         """Get action from current policy"""
         with torch.no_grad():
             if deterministic:
                 # Use mean action for deterministic policy
                 action_mean, _, _ = self.actor_critic.policy_network(state)
-                return action_mean
+                # action = torch.tanh(action_mean)
+                return action_mean * 10
             else:
                 # Sample action from policy
                 _, sampled_action, _ = self.actor_critic.policy_network(state)
-                return sampled_action
+                return sampled_action * 10
 
     def update_target_network(self, tau=None):
         """Soft update of target network parameters"""
         if tau is None:
             tau = self.tau
-        for target_param, param in zip(self.target_actor_critic.parameters(), 
+        for target_param, param in zip(self.target_actor_critic.parameters(),
                                      self.actor_critic.parameters()):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
@@ -361,9 +331,9 @@ class DCLP:
 
         # ============= Actor Update =============
         # Get current policy actions and Q-values
-        _, policy_actions, log_probs = self.actor_critic.policy_network(states)
+        action_mean, policy_actions, log_probs = self.actor_critic.policy_network(states)
         _, policy_actions_squashed, log_probs_adjusted = apply_squashing_func(
-            policy_actions, policy_actions, log_probs
+            action_mean, policy_actions, log_probs
         )
 
         # Q-values for policy actions
@@ -392,7 +362,13 @@ class DCLP:
             'critic_loss': critic_loss.item(),
             'q1_mean': current_q1.mean().item(),
             'q2_mean': current_q2.mean().item(),
-            'target_q_mean': target_q.mean().item()
+            'target_q_mean': target_q.mean().item(),
+            'policy_q1_mean': policy_q1.mean().item(),
+            'policy_q2_mean': policy_q2.mean().item(),
+            'policy_q_mean': policy_q.mean().item(),
+            'log_probs_mean': log_probs_adjusted.mean().item(),
+            'entropy_term': (self.alpha * log_probs_adjusted).mean().item(),
+            'alpha': self.alpha
         }
 
     def save(self, filepath):
