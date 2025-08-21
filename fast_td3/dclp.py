@@ -20,19 +20,19 @@ class MLPGaussianPolicy(nn.Module):
         action_dim,
         hidden_sizes=[128, 128, 128, 128],
         activation=F.leaky_relu,
-        output_activation=None
+        output_activation=F.leaky_relu
     ):
         super().__init__()
         self.action_dimension = action_dim
         self.num_mixture_components = 4
-        self.hidden_size = [128, 128, 128, 128]
+        self.hidden_size = hidden_sizes
         self.alpha_activation_param = nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
         self.net = MLP(
             input_dim=138, # the flattened_features has 128 elements, and the rest of the observation has 10 elements (280 - 270)
             hidden_sizes=self.hidden_size,
-            activation=F.leaky_relu,
-            output_activation=F.leaky_relu,
+            activation=activation,
+            output_activation=output_activation,
         )
         self.gmm_output_layer = nn.Linear(self.hidden_size[-1], (action_dim * 2 + 1) * self.num_mixture_components)
 
@@ -41,6 +41,7 @@ class MLPGaussianPolicy(nn.Module):
         batch_size = obs.shape[0]
         num_lidar_points = 90  # 270/3
         lidar_raw = obs[:, :270].reshape(batch_size, num_lidar_points, 3)
+        lidar_raw = lidar_raw.clone()  # 关键：避免原地操作影响 autograd
         lidar_raw[:, :, 2] = reciprocal_relu(lidar_raw[:, :, 2],
                                              alpha_activation=self.alpha_activation_param)
 
@@ -132,7 +133,7 @@ class MLPActorCritic(nn.Module):
             action_dim,
             hidden_sizes=(128, 128, 128, 128),
             activation=F.leaky_relu,
-            output_activation=None
+            output_activation=F.leaky_relu
             ):
         super(MLPActorCritic, self).__init__()
 
@@ -261,12 +262,12 @@ class DCLP:
         with torch.no_grad():
             if deterministic:
                 # Use mean action for deterministic policy
-                action_mean, _, _ = self.actor_critic.policy_network(state)
+                action_mean, _, _, _, _ = self.actor_critic(state)
                 # action = torch.tanh(action_mean)
                 return action_mean
             else:
                 # Sample action from policy
-                _, sampled_action, _ = self.actor_critic.policy_network(state)
+                _, sampled_action, _, _, _ = self.actor_critic(state)
                 return sampled_action
 
     def update_target_network(self, tau=None):
@@ -292,34 +293,15 @@ class DCLP:
         # ============= Critic Update =============
         with torch.no_grad():
             # Target actions from target policy
-            _, next_actions, next_log_probs = self.target_actor_critic.policy_network(next_states)
-
-            # Apply squashing and get target Q-values
-            _, next_actions_squashed, next_log_probs_adjusted = apply_squashing_func(
-                next_actions, next_actions, next_log_probs
-            )
-
-            # Get target Q-values
-            target_features = self.target_actor_critic.shared_cnn_dense(next_states)
-            target_q1 = self.target_actor_critic.q_network_1(
-                torch.cat([target_features, next_actions_squashed], dim=-1)
-            ).squeeze(-1)
-            target_q2 = self.target_actor_critic.q_network_2(
-                torch.cat([target_features, next_actions_squashed], dim=-1)
-            ).squeeze(-1)
+            _, _, next_log_probs, target_q1, target_q2 = self.target_actor_critic(next_states)
 
             # Take minimum and subtract entropy term
-            target_q = torch.min(target_q1, target_q2) - self.alpha * next_log_probs_adjusted
-            target_q = rewards + (~dones) * self.gamma * target_q
+            target_q = torch.min(target_q1, target_q2) - self.alpha * next_log_probs
+            # target_q = rewards + (~dones) * self.gamma * target_q
+            target_q = rewards + self.gamma * target_q
 
         # Current Q-values
-        current_features = self.actor_critic.shared_cnn_dense(states)
-        current_q1 = self.actor_critic.q_network_1(
-            torch.cat([current_features, actions], dim=-1)
-        ).squeeze(-1)
-        current_q2 = self.actor_critic.q_network_2(
-            torch.cat([current_features, actions], dim=-1)
-        ).squeeze(-1)
+        _, _, _, current_q1, current_q2, _, _ = self.actor_critic(states, actions)
 
         # Critic loss
         critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
@@ -329,30 +311,36 @@ class DCLP:
         critic_loss.backward()
         self.critic_optimizer.step()
 
+        # 冻结Q网络参数，只更新策略网络
+        for param in self.actor_critic.q_network_1.parameters():
+            param.requires_grad = False
+        for param in self.actor_critic.q_network_2.parameters():
+            param.requires_grad = False
+        for param in self.actor_critic.shared_cnn_dense.parameters():
+            param.requires_grad = False
+
         # ============= Actor Update =============
         # Get current policy actions and Q-values
-        action_mean, policy_actions, log_probs = self.actor_critic.policy_network(states)
-        _, policy_actions_squashed, log_probs_adjusted = apply_squashing_func(
-            action_mean, policy_actions, log_probs
-        )
-
-        # Q-values for policy actions
-        policy_q1 = self.actor_critic.q_network_1(
-            torch.cat([current_features.detach(), policy_actions_squashed], dim=-1)
-        ).squeeze(-1)
-        policy_q2 = self.actor_critic.q_network_2(
-            torch.cat([current_features.detach(), policy_actions_squashed], dim=-1)
-        ).squeeze(-1)
+        _, _, log_probs, _, _ = self.actor_critic(states)
+        with torch.no_grad():
+            _, _, _, policy_q1, policy_q2 = self.actor_critic(states)
 
         policy_q = torch.min(policy_q1, policy_q2)
 
         # Actor loss (negative because we want to maximize Q)
-        actor_loss = (self.alpha * log_probs_adjusted - policy_q).mean()
+        actor_loss = (self.alpha * log_probs - policy_q).mean()
 
         # Update actor
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
+
+        for param in self.actor_critic.q_network_1.parameters():
+            param.requires_grad = True
+        for param in self.actor_critic.q_network_2.parameters():
+            param.requires_grad = True
+        for param in self.actor_critic.shared_cnn_dense.parameters():
+            param.requires_grad = True
 
         # Update target network
         self.update_target_network(tau=self.tau)
@@ -366,8 +354,8 @@ class DCLP:
             'policy_q1_mean': policy_q1.mean().item(),
             'policy_q2_mean': policy_q2.mean().item(),
             'policy_q_mean': policy_q.mean().item(),
-            'log_probs_mean': log_probs_adjusted.mean().item(),
-            'entropy_term': (self.alpha * log_probs_adjusted).mean().item(),
+            'log_probs_mean': log_probs.mean().item(),
+            'entropy_term': (self.alpha * log_probs).mean().item(),
             'alpha': self.alpha
         }
 
