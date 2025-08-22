@@ -169,7 +169,7 @@ class CNNDense(nn.Module):
         super(CNNDense, self).__init__()
         # 定义可训练激活参数
         self.alpha_activation_param = nn.Parameter(torch.tensor(0.0), requires_grad=True)
-        self.conv_layer_1 = nn.Conv1d(3, 32, kernel_size=1, stride=1, padding=0)
+        self.conv_layer_1 = nn.Conv1d(6, 32, kernel_size=1, stride=1, padding=0)
         self.conv_layer_2 = nn.Conv1d(32, 64, kernel_size=1, stride=1, padding=0)
         self.conv_layer_3 = nn.Conv1d(64, 128, kernel_size=1, stride=1, padding=0)
         self.max_pool = nn.MaxPool1d(kernel_size=90, stride=1, padding=0)
@@ -198,23 +198,27 @@ class CNNDense(nn.Module):
             7. Concatenates the CNN-extracted features with the remaining robot state information.
         """
         # 提取和重塑激光雷达数据
-        lidar_data = input_data[:, 0:3*90]                                                          # 激光雷达数据段
-        reshaped_lidar = lidar_data.view(-1, 90, 3)                                                 # [batch, 90方向, 3特征]
+        lidar_data = input_data[:, 0:6*90]  # 激光雷达数据段
+        reshaped_lidar = lidar_data.view(-1, 90, 6)  # [batch, 90方向, 6特征]
+        # 对距离特征应用自定义激活
         processed_distance = reciprocal_relu(reshaped_lidar[:, :, 2], self.alpha_activation_param)  # 处理距离信息(第3个特征)
         # 重新组合特征
         combined_lidar_features = torch.cat([
-            reshaped_lidar[:, :, 0:2],                                                              # 方向信息(cos, sin)
-            processed_distance.unsqueeze(-1),                                                       # 处理后的距离
+            reshaped_lidar[:, :, 0:2],          # 方向信息(cos, sin)
+            processed_distance.unsqueeze(-1),   # 处理后的距离
+            reshaped_lidar[:, :, 3:6]           # 机器人几何信息(length1, length2, width)
         ], dim=-1)
-        transposed_features = combined_lidar_features.transpose(1, 2)                               # 转换为Conv1d格式: [batch, features, sequence]
-
-        conv1_output = F.leaky_relu(self.conv_layer_1(transposed_features))                         # 三层1D卷积提取特征
+        # 转换为Conv1d格式: [batch, features, sequence]
+        transposed_features = combined_lidar_features.transpose(1, 2)
+        # 三层1D卷积提取特征
+        conv1_output = F.leaky_relu(self.conv_layer_1(transposed_features))
         conv2_output = F.leaky_relu(self.conv_layer_2(conv1_output))
         conv3_output = F.leaky_relu(self.conv_layer_3(conv2_output))
-
-        pooled_features = self.max_pool(conv3_output)                                               # 全局最大池化
+        # 全局最大池化
+        pooled_features = self.max_pool(conv3_output)
         flattened_cnn_features = pooled_features.view(pooled_features.size(0), -1)
-        return torch.cat([flattened_cnn_features, input_data[:, 3*90:]], dim=-1)                    # 拼接CNN特征和其他状态信息
+        # 拼接CNN特征和其他状态信息
+        return torch.cat([flattened_cnn_features, input_data[:, 6*90:]], dim=-1)
 
 class CNNNet(nn.Module):
     """
@@ -223,7 +227,7 @@ class CNNNet(nn.Module):
         activation (callable, optional): Activation function to use after each convolutional layer. Default is F.relu.
         output_activation (callable, optional): Activation function to use at the output layer. Default is None.
     Layers:
-        conv_layer_1 (nn.Conv1d): First 1D convolutional layer (in_channels=3, out_channels=32, kernel_size=1).
+        conv_layer_1 (nn.Conv1d): First 1D convolutional layer (in_channels=6, out_channels=32, kernel_size=1).
         conv_layer_2 (nn.Conv1d): Second 1D convolutional layer (in_channels=32, out_channels=64, kernel_size=1).
         conv_layer_3 (nn.Conv1d): Third 1D convolutional layer (in_channels=64, out_channels=128, kernel_size=1).
         max_pool (nn.MaxPool1d): 1D max pooling layer (kernel_size=90, stride=1).
@@ -236,15 +240,16 @@ class CNNNet(nn.Module):
 
     def __init__(self, activation=F.relu, output_activation=None):
         super(CNNNet, self).__init__()
-        self.conv_layer_1 = nn.Conv1d(3, 32, kernel_size=1, stride=1, padding=0)
+        self.conv_layer_1 = nn.Conv1d(6, 32, kernel_size=1, stride=1, padding=0)
         self.conv_layer_2 = nn.Conv1d(32, 64, kernel_size=1, stride=1, padding=0)
         self.conv_layer_3 = nn.Conv1d(64, 128, kernel_size=1, stride=1, padding=0)
         self.max_pool = nn.MaxPool1d(kernel_size=90, stride=1, padding=0)
         self.activation_func = activation
-
+    
     def forward(self, input_tensor, additional_input=None):
         # input_tensor shape: [batch_size, sequence_length, features] -> [batch_size, features, sequence_length]
         transposed_input = input_tensor.transpose(1, 2)
+        
         conv1_output = F.leaky_relu(self.conv_layer_1(transposed_input))
         conv2_output = F.leaky_relu(self.conv_layer_2(conv1_output))
         conv3_output = F.leaky_relu(self.conv_layer_3(conv2_output))

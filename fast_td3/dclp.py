@@ -15,93 +15,100 @@ LOG_STD_MIN = -20
 
 class MLPGaussianPolicy(nn.Module):
     def __init__(
-        self,
-        state_dim,
-        action_dim,
-        hidden_sizes=[128, 128, 128, 128],
-        activation=F.leaky_relu,
-        output_activation=F.leaky_relu
-    ):
-        super().__init__()
+            self,
+            state_dim,
+            action_dim,
+            hidden_sizes=[128, 128, 128, 128],
+            activation=F.leaky_relu,
+            output_activation=None
+            ):
+        super(MLPGaussianPolicy, self).__init__()
+        self.num_mixture_components = 4  # 高斯混合组件数量
         self.action_dimension = action_dim
-        self.num_mixture_components = 4
-        self.hidden_size = hidden_sizes
+        self.hidden_activation = activation
+        self.output_activation = output_activation
+        # CNN自适应激活参数
         self.alpha_activation_param = nn.Parameter(torch.tensor(0.0), requires_grad=True)
+        # CNN网络
+        self.cnn_feature_extractor = CNNNet()
+        # MLP网络
+        # CNN输出128维 + 其他状态信息10维 = 138维
+        self.mlp_network = MLP(138, hidden_sizes, activation, activation)
+        # GMM参数输出层
+        self.gmm_output_layer = nn.Linear(hidden_sizes[-1], (self.action_dimension*2+1)*self.num_mixture_components)
 
-        self.net = MLP(
-            input_dim=138, # the flattened_features has 128 elements, and the rest of the observation has 10 elements (280 - 270)
-            hidden_sizes=self.hidden_size,
-            activation=activation,
-            output_activation=output_activation,
-        )
-        self.gmm_output_layer = nn.Linear(self.hidden_size[-1], (action_dim * 2 + 1) * self.num_mixture_components)
+    def forward(self, state_input):
+        """
+        Forward pass of the model.
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        # obs: [n_env * batch_size, n_obs] = [1024 * 32, 280] in each row the first 270 elements are LiDAR data
-        batch_size = obs.shape[0]
-        num_lidar_points = 90  # 270/3
-        lidar_raw = obs[:, :270].reshape(batch_size, num_lidar_points, 3)
-        lidar_raw = lidar_raw.clone()  # 关键：避免原地操作影响 autograd
-        lidar_raw[:, :, 2] = reciprocal_relu(lidar_raw[:, :, 2],
-                                             alpha_activation=self.alpha_activation_param)
+        Args:
+            state_input (torch.Tensor): Input tensor of shape [batch_size, input_dim]. The input contains concatenated lidar features,
+                additional state information, and possibly other features.
 
-        cnn = getattr(self, 'cnn', None)
-        if cnn is None:
-            self.cnn = CNNNet().to(obs.device)
-            cnn = self.cnn
-        flattened_features = cnn(lidar_raw)
-        obs_rest = obs[:, 270:]  # [batch_size, n_obs-270]
-        obs_new = torch.cat([flattened_features, obs_rest], dim=1)
+        Returns:
+            tuple:
+                - selected_component_mean (torch.Tensor): The mean of the selected Gaussian component for each sample, shape [batch_size, action_dimension].
+                - sampled_action (torch.Tensor): The sampled action from the selected Gaussian component, shape [batch_size, action_dimension].
+                - log_probability (torch.Tensor): The log-probability of the sampled action under the Gaussian Mixture Model, shape [batch_size].
+        
+        Workflow:
+            1. Processes lidar data and applies a custom activation to the distance feature.
+            2. Extracts additional state information.
+            3. Extracts features using a CNN and concatenates with other features.
+            4. Processes concatenated features with an MLP.
+            5. Generates GMM parameters (weights, means, log-stds) for each mixture component.
+            6. Applies constraints to log-stds for numerical stability.
+            7. Samples a Gaussian component and draws an action using the reparameterization trick.
+            8. Computes the log-probability of the sampled action under the GMM.
+        """
 
-        # 直接处理观测，不需要动作输入
-        x = self.net(obs_new)
-        gmm_parameters = self.gmm_output_layer(x)
+        batch_size = state_input.shape[0]
+        # 处理激光雷达数据
+        lidar_data = state_input[:, 0:6*90]
+        reshaped_lidar = lidar_data.view(-1, 90, 6)
+        # 对距离特征应用自定义激活
+        processed_distance = reciprocal_relu(reshaped_lidar[:, :, 2], self.alpha_activation_param)
+        combined_lidar_features = torch.cat([
+            reshaped_lidar[:, :, 0:2],
+            processed_distance.unsqueeze(-1),
+            reshaped_lidar[:, :, 3:6]
+        ], dim=-1)
+        # 提取其他状态信息, not used in this context
+        additional_state_info = state_input[:, 6*90:6*90+8]
+        additional_state_info = additional_state_info.view(-1, 8)
+        # CNN特征提取
+        cnn_features = self.cnn_feature_extractor(combined_lidar_features, additional_state_info)
+        # 特征拼接
+        concatenated_features = torch.cat([cnn_features, state_input[:, 6*90:]], dim=-1)
+        # MLP处理
+        mlp_output = self.mlp_network(concatenated_features)
+        # 生成GMM参数：(权重 + 均值 + 对数标准差) × k个组件
+        gmm_parameters = self.gmm_output_layer(mlp_output)
         reshaped_gmm_params = gmm_parameters.view(-1, self.num_mixture_components, 2*self.action_dimension+1)
-
-        # divide parameters
-        log_mixture_weights = reshaped_gmm_params[..., 0]              # [N, K]
-        component_means = reshaped_gmm_params[..., 1:1+self.action_dimension]       # [N, K, action_dimension]
-        log_component_std = reshaped_gmm_params[..., 1+self.action_dimension:]   # [N, K, action_dimension]
-
-        # constrain log std to safe range
+        # 分离参数
+        log_mixture_weights = reshaped_gmm_params[..., 0]              # 混合权重 [N, K]
+        component_means = reshaped_gmm_params[..., 1:1+self.action_dimension]       # 均值 [N, K, action_dimension]
+        log_component_std = reshaped_gmm_params[..., 1+self.action_dimension:]   # 对数标准差 [N, K, action_dimension]
+        # 约束对数标准差到安全范围
         constrained_log_std = torch.tanh(log_component_std)
         constrained_log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (constrained_log_std + 1)
         component_std_devs = torch.exp(constrained_log_std)
-
-        # 选择组件 - 使用数值稳定的softmax
-        # 检查和处理 NaN/inf 值
-        if torch.any(torch.isnan(log_mixture_weights)) or torch.any(torch.isinf(log_mixture_weights)):
-            log_mixture_weights = torch.zeros_like(log_mixture_weights)
-
-        # 对数权重进行裁剪以确保数值稳定性
-        clipped_log_weights = torch.clamp(log_mixture_weights, min=-10.0, max=10.0)
-        mixture_probs = torch.softmax(clipped_log_weights, dim=-1)
-
-        # 再次检查和修复概率
-        if torch.any(torch.isnan(mixture_probs)) or torch.any(mixture_probs < 0):
-            mixture_probs = torch.ones_like(mixture_probs) / mixture_probs.shape[-1]
-
-        # 确保概率都是正数且和为1
-        mixture_probs = torch.clamp(mixture_probs, min=1e-8, max=1.0)
-        mixture_probs = mixture_probs / mixture_probs.sum(dim=-1, keepdim=True)
-
-        selected_component_idx = torch.multinomial(mixture_probs, num_samples=1)
-
+        # 采样高斯组件
+        selected_component_idx = torch.multinomial(torch.softmax(log_mixture_weights, dim=-1), num_samples=1)  # 选择组件
         # 获取选中组件的参数
-        batch_indices = torch.arange(batch_size, device=obs.device)
-        selected_component_mean = component_means[batch_indices, selected_component_idx.squeeze(-1)]  # 选中组件均值
-        selected_component_std = component_std_devs[batch_indices, selected_component_idx.squeeze(-1)]  # 选中组件标准差
-
+        batch_indices = torch.arange(batch_size, device=state_input.device)
+        selected_component_mean = component_means[batch_indices, selected_component_idx.squeeze(-1)]      # 选中组件均值
+        selected_component_std = component_std_devs[batch_indices, selected_component_idx.squeeze(-1)] # 选中组件标准差
         # 重参数化采样：a = μ + σ * ε
-        random_noise = torch.randn((batch_size, self.action_dimension), device=obs.device)
+        random_noise = torch.randn((batch_size, self.action_dimension), device=state_input.device)
         sampled_action = selected_component_mean + selected_component_std * random_noise
-
         # 计算动作概率
         component_log_probs = create_log_gaussian(component_means, constrained_log_std, sampled_action.unsqueeze(1))  # 各组件概率
-        log_prob_numerator = torch.logsumexp(component_log_probs + log_mixture_weights, dim=1)  # 分子
-        log_prob_denominator = torch.logsumexp(log_mixture_weights, dim=1)  # 分母
-        log_probability = log_prob_numerator - log_prob_denominator  # 非原地操作
-
+        # log_p_x_t = torch.logsumexp(component_log_probs + log_mixture_weights, dim=1)      # 边际概率
+        # log_p_x_t -= torch.logsumexp(log_mixture_weights, dim=1)                   # 归一化
+        log_prob_numerator = torch.logsumexp(component_log_probs + log_mixture_weights, dim=1)    # 分子
+        log_prob_denominator = torch.logsumexp(log_mixture_weights, dim=1)               # 分母  
+        log_probability = log_prob_numerator - log_prob_denominator              # 非原地操作
         return selected_component_mean, sampled_action, log_probability
 
 
@@ -151,11 +158,13 @@ class MLPActorCritic(nn.Module):
             )
 
         # ============= Critic网络(价值网络) =============
-        # 使用自定义的CNN特征提取器(匹配270维LiDAR输入)
+        # 使用自定义的CNN特征提取器(匹配540维LiDAR输入，90个点*6个特征)
         self.shared_cnn_dense = CNNDense(activation, None)
 
         # Q网络：输入特征+动作，输出Q值
-        q_network_input_dim = 128 + 10 + action_dim  # CNN特征 138维 + 动作 2维 = 140维
+        # CNN特征 128维 + 其他观测特征 (总观测维度 - 540) + 动作维度
+        other_obs_dim = state_dim - 540  # 其他观测特征的维度
+        q_network_input_dim = 128 + other_obs_dim + action_dim
         self.q_network_1 = MLP(q_network_input_dim, list(hidden_sizes) + [1], activation, None)
         self.q_network_2 = MLP(q_network_input_dim, list(hidden_sizes) + [1], activation, None)
         
