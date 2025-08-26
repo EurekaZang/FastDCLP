@@ -321,10 +321,10 @@ def main():
                 ):
                     actions = dclp.get_action(norm_obs)
                     wandb.log({
-                        "env1_left_wheel_action": actions[0][0],
-                        "env1_right_wheel_action": actions[0][1],
-                        "linear velocity": calculate_turtlebot_velocities(actions[0][0], actions[0][1])[0],
-                        "angular velocity": calculate_turtlebot_velocities(actions[0][0], actions[0][1])[1],
+                        "env1_left_wheel_action": actions[0][0] * 10,
+                        "env1_right_wheel_action": actions[0][1] * 10,
+                        "linear velocity": calculate_turtlebot_velocities(actions[0][0] * 10, actions[0][1] * 10)[0],
+                        "angular velocity": calculate_turtlebot_velocities(actions[0][0] * 10, actions[0][1] * 10)[1],
                     })
         next_obs, rewards, next_dones, infos = envs.step(actions.float())
         if hasattr(reward_normalizer, 'update_stats'):

@@ -273,10 +273,12 @@ class DCLP:
                 # Use mean action for deterministic policy
                 action_mean, _, _, _, _ = self.actor_critic(state)
                 # action = torch.tanh(action_mean)
+                print(f"Deterministic action mean: {action_mean}")
                 return action_mean
             else:
                 # Sample action from policy
                 _, sampled_action, _, _, _ = self.actor_critic(state)
+                print(f"Stochastic sampled action: {sampled_action}")
                 return sampled_action
 
     def update_target_network(self, tau=None):
