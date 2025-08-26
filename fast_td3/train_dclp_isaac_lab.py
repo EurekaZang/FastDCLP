@@ -192,7 +192,7 @@ def main():
                         device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
                     ):
                         actions = dclp.get_action(norm_obs)
-                    obs, reward, done, info = envs.step(actions.float())
+                    obs, reward, done, info = envs.step(actions)
                     episode_return += reward.mean().item()
                     episode_length += 1
                     # Update step progress bar with current reward

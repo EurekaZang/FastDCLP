@@ -273,13 +273,15 @@ class DCLP:
                 # Use mean action for deterministic policy
                 action_mean, _, _, _, _ = self.actor_critic(state)
                 # action = torch.tanh(action_mean)
-                print(f"Deterministic action mean: {action_mean}")
-                return action_mean
+                # print(f"Deterministic action mean: {action_mean}")
+                wheel_speeds = self.map_velocities_to_wheel_speeds(action_mean)
+                return wheel_speeds
             else:
                 # Sample action from policy
                 _, sampled_action, _, _, _ = self.actor_critic(state)
-                print(f"Stochastic sampled action: {sampled_action}")
-                return sampled_action
+                # print(f"Stochastic sampled action: {sampled_action}")
+                wheel_speeds = self.map_velocities_to_wheel_speeds(sampled_action)
+                return wheel_speeds
 
     def update_target_network(self, tau=None):
         """Soft update of target network parameters"""
@@ -386,3 +388,49 @@ class DCLP:
         self.target_actor_critic.load_state_dict(checkpoint['target_actor_critic'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
+
+    def map_velocities_to_wheel_speeds(
+        actions: torch.Tensor,
+        wheel_radius: float = 0.036,
+        wheel_base: float = 0.235
+    ) -> torch.Tensor:
+        """
+        Args:
+            actions (torch.Tensor): 一个形状为 (num_envs, 2) 的张量。
+                                    每一行代表一个环境的动作，格式为 [linear_velocity, angular_velocity]。
+                                    - linear_velocity (v): 机器人的前进/后退速度 (m/s)。
+                                    - angular_velocity (ω): 机器人的旋转速度 (rad/s)。
+            wheel_radius (float): 机器人轮子的半径 (R)，单位为米 (m)。
+            wheel_base (float): 机器人左右轮之间的距离 (L)，也称为轮距，单位为米 (m)。
+        Returns:
+            torch.Tensor: 一个形状为 (num_envs, 2) 的张量。
+                        每一行代表对应环境下两个轮子的目标角速度，
+                        格式为 [left_wheel_angular_velocity, right_wheel_angular_velocity]。
+                        单位为 rad/s。
+        """
+        # 检查输入张量的形状
+        if actions.ndim != 2 or actions.shape[1] != 2:
+            raise ValueError(f"输入张量 'actions' 的形状应为 (num_envs, 2), 但得到的是 {actions.shape}")
+        # 从输入张量中解构线速度和角速度
+        # actions[:, 0] 是所有环境的线速度 v
+        # actions[:, 1] 是所有环境的角速度 ω
+        linear_velocity = actions[:, 0]
+        angular_velocity = actions[:, 1]
+
+        # 应用运动学逆解公式
+        # v_l = v - (ω * L) / 2
+        # v_r = v + (ω * L) / 2
+        # 我们直接计算轮子的角速度 ω_wheel = v_wheel / R
+        # 注意：这里我们同时为所有环境计算结果，这是向量化的优势
+
+        # ω_left = (v - (ω * L) / 2) / R
+        omega_left = (linear_velocity - (angular_velocity * wheel_base) / 2.0) / wheel_radius
+
+        # ω_right = (v + (ω * L) / 2) / R
+        omega_right = (linear_velocity + (angular_velocity * wheel_base) / 2.0) / wheel_radius
+
+        # 将左右轮的角速度堆叠成一个 (num_envs, 2) 的张量并返回
+        # 使用 torch.stack 并指定维度 1，可以将两个 (num_envs,) 的张量合并成 (num_envs, 2)
+        wheel_speeds = torch.stack([omega_left, omega_right], dim=1)
+
+        return wheel_speeds
