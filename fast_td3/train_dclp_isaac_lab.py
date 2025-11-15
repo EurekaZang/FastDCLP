@@ -2,11 +2,11 @@
 """
 train_dclp_isaac_lab.py - Training script for DCLP model with IsaacLab environments
 
-This script trains the DCLP (Deep Contextual Lidar Processing) model using FastTD3 algorithm
+This script trains the DCLP model using FastTD3 algorithm
 with IsaacLab navigation environments. It's optimized for efficient training with LiDAR data.
 
 Usage:
-    python train_dclp_isaac_lab.py --env_name Isaac-Navigation-Flat-Turtlebot2-v0 --total_timesteps 1000000
+    python train_dclp_isaac_lab.py --env_name Isaac-Navigation-Flat-Jackal-v0     --num_envs 32 --buffer_size 10240 --batch_size 32     --lidar_points 90     --actor_hidden_dim 256 --critic_hidden_dim 256     --learning_starts 10000 --total_timesteps 1000000   --exp_name "try_training_with_potential_reward" --no-headless
 """
 
 import os
@@ -65,14 +65,9 @@ def main():
     run_name = f"{args.env_name}__{args.exp_name}__{args.seed}"
 
     # Setup mixed precision
-    amp_enabled = args.amp and args.cuda and torch.cuda.is_available()
-    amp_device_type = (
-        "cuda" if args.cuda and torch.cuda.is_available()
-        else "mps" if args.cuda and torch.backends.mps.is_available()
-        else "cpu"
-    )
-    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
-    scaler = GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
+    amp_enabled = False
+    amp_device_type = "cpu"
+    amp_dtype = torch.float32
 
     # Initialize W&B
     if args.use_wandb:
@@ -105,12 +100,12 @@ def main():
     print(f"Creating IsaacLab environment: {args.env_name}")
     envs = IsaacLabEnv(
         task_name=args.env_name,
-        device=device.type,
+        device=str(device),
         num_envs=args.num_envs,
         seed=args.seed,
         action_bounds=args.action_bounds,
-        render_mode="human",
-        headless=True,
+        render_mode=args.render_mode,
+        headless=args.headless,
     )
 
     # Get environment dimensions
@@ -144,11 +139,26 @@ def main():
         tau=args.tau,
         alpha=args.alpha,
         hidden_sizes=(args.actor_hidden_dim, args.actor_hidden_dim, args.actor_hidden_dim, args.actor_hidden_dim),
+        use_grad_norm_clipping=args.use_grad_norm_clipping,
+        max_grad_norm=args.max_grad_norm,
         device=device
     )
 
     print("DCLP network initialized successfully")
     print("Optimizers and schedulers initialized successfully")
+
+    q_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        dclp.critic_optimizer,
+        T_max=args.total_timesteps,
+        eta_min=torch.tensor(args.critic_learning_rate_end, device=device),
+    )
+    print("Q-scheduler initialized successfully")
+    actor_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        dclp.actor_optimizer,
+        T_max=args.total_timesteps,
+        eta_min=torch.tensor(args.actor_learning_rate_end, device=device),
+    )
+    print("Actor-scheduler initialized successfully")
 
     # Replay buffer
     rb = SimpleReplayBuffer(
@@ -164,6 +174,7 @@ def main():
         device=device,
     )
     print("Replay buffer initialized successfully")
+    #FIXME: Any problem?
     def evaluate():
         """Evaluation function"""
         print("Running evaluation...")
@@ -188,10 +199,7 @@ def main():
                         norm_obs = obs_normalizer(obs, update=False)
                     else:
                         norm_obs = obs
-                    with torch.no_grad(), autocast(
-                        device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
-                    ):
-                        actions = dclp.get_action(norm_obs)
+                    actions = dclp.get_action(norm_obs)
                     obs, reward, done, info = envs.step(actions)
                     episode_return += reward.mean().item()
                     episode_length += 1
@@ -229,44 +237,46 @@ def main():
         
         return mean_return
     
-    def update_dclp(data, logs_dict):
-        """Update DCLP network (both actor and critic)"""
+    
 
-        # Extract data from TensorDict format
-        observations = data["observations"].float()  # Convert from float16 to float32
-        actions = data["actions"]
-        rewards = data["next"]["rewards"]
-        next_observations = data["next"]["observations"].float()  # Convert from float16 to float32
-        dones = data["next"]["dones"].bool()
+    # def update_dclp(data, logs_dict):
+    #     """Update DCLP network (both actor and critic)"""
+    #     #TODO: Add autocast? Be same to FastTD3
+    #     # Extract data from TensorDict format
+    #     observations = data["observations"].float()  # Convert from float16 to float32
+    #     actions = data["actions"]
+    #     rewards = data["next"]["rewards"]
+    #     next_observations = data["next"]["observations"].float()  # Convert from float16 to float32
+    #     dones = data["next"]["dones"].bool()
 
-        if args.obs_normalization:
-            normalized_obs = obs_normalizer(observations, update=True)
-            normalized_next_obs = obs_normalizer(next_observations, update=False)
-        else:
-            normalized_obs = observations
-            normalized_next_obs = next_observations
+    #     if args.obs_normalization:
+    #         normalized_obs = obs_normalizer(observations,  update=True)
+    #         normalized_next_obs = obs_normalizer(next_observations, update=False)
+    #     else:
+    #         normalized_obs = observations
+    #         normalized_next_obs = next_observations
 
-        # Prepare batch data for DCLP
-        batch = {
-            'state': normalized_obs.cpu().numpy(),
-            'action': actions.cpu().numpy(),
-            'reward': rewards.cpu().numpy(),
-            'next_state': normalized_next_obs.cpu().numpy(),
-            'done': dones.cpu().numpy()
-        }
+    #     # Prepare batch data for DCLP
+    #     batch = {
+    #         'state': normalized_obs.cpu().numpy(),
+    #         'action': actions.cpu().numpy(),
+    #         'reward': rewards.cpu().numpy(),
+    #         'next_state': normalized_next_obs.cpu().numpy(),
+    #         'done': dones.cpu().numpy()
+    #     }
 
-        # Train DCLP
-        train_metrics = dclp.train_step(batch)
+    #     # Train DCLP
+    #     train_metrics = dclp.train_step(batch)
 
-        # Calculate total episode reward
-        total_episode_reward = rewards.sum().item()
+    #     # Calculate total episode reward
+    #     total_episode_reward = rewards.sum().item()
 
-        # Log total episode reward to W&B
-        if args.use_wandb:
-            logs_dict["total_episode_reward"] = total_episode_reward
+    #     # Log total episode reward to W&B
+    #     if args.use_wandb:
+    #         logs_dict["total_episode_reward"] = total_episode_reward
 
-        # Log metrics
-        logs_dict.update(train_metrics)
+    #     # Log metrics
+    #     logs_dict.update(train_metrics)
 
     # Log hyperparameters to W&B
     if args.use_wandb:
@@ -291,14 +301,7 @@ def main():
             "system/cpu_memory_usage": psutil.virtual_memory().percent,
         })
 
-    # Log training metrics to W&B
-    if args.use_wandb:
-        wandb.log({
-            "train/actor_loss": 0,
-            "train/critic_loss": 0,
-            "train/learning_rate": args.actor_learning_rate,
-            "train/grad_norm": 0,
-        })
+
 
     # Training loop
     global_step = 0
@@ -307,6 +310,7 @@ def main():
     pbar = tqdm.tqdm(total=args.total_timesteps, initial=global_step)
     start_time = time.time()
     print("🚀 Starting DCLP training...")
+    #TODO: Check the logic
     while global_step < args.total_timesteps:
         with torch.no_grad():
             if global_step < args.learning_starts:
@@ -316,20 +320,30 @@ def main():
                     norm_obs = obs_normalizer(obs, update=False)
                 else:
                     norm_obs = obs
-                with torch.no_grad(), autocast(
-                    device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
-                ):
-                    actions = dclp.get_action(norm_obs)
-                    wandb.log({
-                        "env1_left_wheel_action": actions[0][0] * 10,
-                        "env1_right_wheel_action": actions[0][1] * 10,
-                        "linear velocity": calculate_turtlebot_velocities(actions[0][0] * 10, actions[0][1] * 10)[0],
-                        "angular velocity": calculate_turtlebot_velocities(actions[0][0] * 10, actions[0][1] * 10)[1],
-                    })
-        next_obs, rewards, next_dones, infos = envs.step(actions.float())
+                actions = dclp.get_action(norm_obs)
+                # print("debug actions",actions)
+                wandb.log({
+                    "env0_linear_action": actions[0][0] * 10,
+                    "env0_angular_action": actions[0][1] * 10,
+                })
+        next_obs, rewards, next_dones, infos = envs.step(actions)
         if hasattr(reward_normalizer, 'update_stats'):
             reward_normalizer.update_stats(rewards, next_dones)
         normalized_rewards = reward_normalizer(rewards) # If --reward-normalization = False, this is identity
+        
+        # if envs.asymmetric_obs:
+        #     next_critic_obs = infos["observations"]["critic"]
+        # # Compute 'true' next_obs and next_critic_obs for saving
+        # true_next_obs = torch.where(
+        #     dones[:, None] > 0, infos["observations"]["raw"]["obs"], next_obs
+        # )
+        # if envs.asymmetric_obs:
+        #     true_next_critic_obs = torch.where(
+        #         dones[:, None] > 0,
+        #         infos["observations"]["raw"]["critic_obs"],
+        #         next_critic_obs,
+        #     )
+
         tensor_dict = TensorDict({
             "observations": obs,
             "actions": actions,
@@ -351,22 +365,81 @@ def main():
         dones = next_dones
         global_step += args.num_envs
         # Training updates
+        logs_dict = {} # 用于存储 *最后一次* 更新的指标
         if global_step >= args.learning_starts:
             for _ in range(args.num_updates):
                 data = rb.sample(args.batch_size)
-                logs_dict = {}
-                update_dclp(data, logs_dict)
-                if args.use_wandb and len(logs_dict) > 0:
-                    logs_dict["train/global_step"] = global_step
-                    logs_dict["rewards"] = data["next"]["rewards"].mean().item()
-                    wandb.log(logs_dict)
+                
+                # --- 数据准备 (从 update_dclp 移入) ---
+                observations = data["observations"].float()
+                actions_batch = data["actions"]
+                rewards_batch = data["next"]["rewards"]
+                next_observations = data["next"]["observations"].float()
+                dones_batch = data["next"]["dones"].bool()
+
+                if args.obs_normalization:
+                    normalized_obs = obs_normalizer(observations,  update=True)
+                    normalized_next_obs = obs_normalizer(next_observations, update=False)
+                else:
+                    normalized_obs = observations
+                    normalized_next_obs = next_observations
+
+                batch = {
+                    'state': normalized_obs.cpu().numpy(),
+                    'action': actions_batch.cpu().numpy(),
+                    'reward': rewards_batch.cpu().numpy(),
+                    'next_state': normalized_next_obs.cpu().numpy(),
+                    'done': dones_batch.cpu().numpy()
+                }
+
+                # Train DCLP 并获取指标
+                logs_dict = dclp.train_step(batch)
+                # 在优化器 step 完成后更新学习率调度器
+                q_scheduler.step()
+                actor_scheduler.step()
+                # 存储用于日志的 buffer 奖励
+                logs_dict["buffer_rewards"] = rewards_batch.mean().item()
+            
+            # --- 新增: 每 100 步记录一次日志 ---
+            if global_step % 100 == 0 and args.use_wandb:
+                elapsed_time = time.time() - start_time
+                speed = global_step / elapsed_time if elapsed_time > 0 else 0
+
+                wandb_logs = {
+                    "speed": speed,
+                    "frame": global_step * args.num_envs,
+                    "critic_lr": q_scheduler.get_last_lr()[0],
+                    "actor_lr": actor_scheduler.get_last_lr()[0],
+                    "env_rewards": rewards.mean().item(), # 'rewards' 是来自 env.step 的最新奖励
+                    
+                    # --- 添加来自 DCLP 的指标 ---
+                    # (使用 .get() 避免在 logs_dict 为空时出错)
+                    "actor_loss": logs_dict.get('actor_loss'),
+                    "qf_loss": logs_dict.get('qf_loss'),
+                    "actor_grad_norm": logs_dict.get('actor_grad_norm'),
+                    "critic_grad_norm": logs_dict.get('critic_grad_norm'),
+                    "buffer_rewards": logs_dict.get('buffer_rewards'),
+                    "qf_max": logs_dict.get('q1_mean'), # 使用 q1_mean 作为 qf_max 的代理
+                    "qf_min": logs_dict.get('q2_mean'), # 使用 q2_mean 作为 qf_min 的代理
+                    "policy_q_mean": logs_dict.get('policy_q_mean'),
+                    "target_q_mean": logs_dict.get('target_q_mean'),
+                    "log_probs_mean": logs_dict.get('log_probs_mean'),
+                    
+                    # --- 动作日志 ---
+                    "env0_linear_action": actions[0][0] * 10,
+                    "env0_angular_action": actions[0][1] * 10,
+                }
+                
+                # 过滤掉 None 值
+                wandb_logs = {k: v for k, v in wandb_logs.items() if v is not None}
+                wandb.log(wandb_logs, step=global_step)
         # Periodic evaluation
         if global_step % (args.eval_interval * args.num_envs) == 0 and global_step > 0:
             evaluate()
         # Periodic model saving
         if global_step % args.save_interval == 0 and global_step > 0:
             os.makedirs("models", exist_ok=True)
-            save_path = f"../models/{run_name}_{global_step}.pt"
+            save_path = f"./models/{run_name}_{global_step}.pt"
             dclp.save(save_path)
             print(f"Model saved to {save_path}")
             # Log model checkpoint to W&B
@@ -383,8 +456,11 @@ def main():
                 f"step: {global_step},"
                 f"buffer: {rb.ptr}/{rb.size},"
                 f"reward: {rewards:.4f},"
+                f"SPS: {steps_per_sec:.2f}" # --- 添加 SPS 到 pbar ---
             )
         pbar.update(args.num_envs)
+
+
     # Final evaluation and save
     print("🏁 Training completed!")
     final_return = evaluate()
