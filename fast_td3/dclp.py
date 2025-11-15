@@ -23,7 +23,7 @@ class MLPGaussianPolicy(nn.Module):
             output_activation=None
             ):
         super(MLPGaussianPolicy, self).__init__()
-        self.num_mixture_components = 4  # 高斯混合组件数量
+        self.num_mixture_components = 5  # 高斯混合组件数量
         self.action_dimension = action_dim
         self.hidden_activation = activation
         self.output_activation = output_activation
@@ -32,8 +32,8 @@ class MLPGaussianPolicy(nn.Module):
         # CNN网络
         self.cnn_feature_extractor = CNNNet()
         # MLP网络
-        # CNN输出128维 + 其他状态信息10维 = 138维
-        self.mlp_network = MLP(138, hidden_sizes, activation, activation)
+        # CNN输出128维 + 其他状态信息8维 = 136维
+        self.mlp_network = MLP(128+state_dim-540, hidden_sizes, activation, activation)
         # GMM参数输出层
         self.gmm_output_layer = nn.Linear(hidden_sizes[-1], (self.action_dimension*2+1)*self.num_mixture_components)
 
@@ -94,6 +94,7 @@ class MLPGaussianPolicy(nn.Module):
         constrained_log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (constrained_log_std + 1)
         component_std_devs = torch.exp(constrained_log_std)
         # 采样高斯组件
+        # print(f"dclp.py:97  log_mixture_weights shape={log_mixture_weights.shape}  min={log_mixture_weights.min().item():.4f}  max={log_mixture_weights.max().item():.4f}  mean={log_mixture_weights.mean().item():.4f}  has_nan={torch.isnan(log_mixture_weights).any().item()}  has_inf={torch.isinf(log_mixture_weights).any().item()}")
         selected_component_idx = torch.multinomial(torch.softmax(log_mixture_weights, dim=-1), num_samples=1)  # 选择组件
         # 获取选中组件的参数
         batch_indices = torch.arange(batch_size, device=state_input.device)
@@ -109,6 +110,8 @@ class MLPGaussianPolicy(nn.Module):
         log_prob_numerator = torch.logsumexp(component_log_probs + log_mixture_weights, dim=1)    # 分子
         log_prob_denominator = torch.logsumexp(log_mixture_weights, dim=1)               # 分母  
         log_probability = log_prob_numerator - log_prob_denominator              # 非原地操作
+        # # 数值稳定保护：替换 NaN/Inf
+        # log_probability = torch.nan_to_num(log_probability, nan=0.0, posinf=1e6, neginf=-1e6)
         return selected_component_mean, sampled_action, log_probability
 
 
@@ -226,17 +229,153 @@ class MLPActorCritic(nn.Module):
         else:
             return squashed_mean, squashed_action, adjusted_log_prob, q1_policy_value, q2_policy_value
 
+#TODO: Implement DSAC
+class MLPActorDistCritic(nn.Module):
+    """
+    Actor-Critic network with distributional critic.
+    """
+    def __init__(
+            self,
+            state_dim,
+            action_dim,
+            actor_hidden_sizes=(128, 128, 128, 128),
+            critic_hidden_sizes=(128, 128, 128, 128),
+            activation=F.leaky_relu,
+            output_activation=F.leaky_relu,
+            num_atoms=251,
+            v_min=-100.0,
+            v_max=100.0,
+            ):
+        super(MLPActorDistCritic, self).__init__()
+
+        self.state_dimension = state_dim
+        self.action_dimension = action_dim
+        self.hidden_activation = activation
+
+        # ============= Actor网络(策略网络) =============
+        self.policy_network = MLPGaussianPolicy(
+            state_dim,
+            action_dim,
+            list(actor_hidden_sizes),
+            activation,
+            output_activation
+            )
+
+        # ============= Critic网络(价值网络) =============
+        # 使用自定义的CNN特征提取器(匹配540维LiDAR输入，90个点*6个特征)
+        self.shared_cnn_dense = CNNDense(activation, None)
+
+        # Q网络：输入特征+动作，输出Q值
+        # CNN特征 128维 + 其他观测特征 (总观测维度 - 540) + 动作维度
+        other_obs_dim = state_dim - 540  # 其他观测特征的维度
+        q_network_input_dim = 128 + other_obs_dim + action_dim
+        self.q_network_1 = DistributionalQNetwork(q_network_input_dim, list(critic_hidden_sizes) + [num_atoms], activation, None, num_atoms, v_min, v_max)
+        self.q_network_2 = DistributionalQNetwork(q_network_input_dim, list(critic_hidden_sizes) + [num_atoms], activation, None, num_atoms, v_min, v_max)
+        
+        # 确保两个Q网络有不同的初始化
+        self._initialize_networks()
+
+    def _initialize_networks(self):
+        for layer in self.q_network_1.layer_modules:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.constant_(layer.bias, 0.0)
+        for layer in self.q_network_2.layer_modules:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.constant_(layer.bias, 0.1)
+
+    def forward(self, state_input, action_input=None):
+        """
+        Performs a forward pass through the actor-critic network.
+        Args:
+            state_input (torch.Tensor): Input state tensor.
+            action_input (torch.Tensor, optional): Action tensor. If provided, computes Q-values for the given actions.
+        Returns:
+            Tuple:
+                If `action_input` is provided:
+                    squashed_mean (torch.Tensor): Mean of the action distribution after squashing.
+                    squashed_action (torch.Tensor): Sampled action after squashing.
+                    adjusted_log_prob (torch.Tensor): Log-probability of the sampled action.
+                    q1_value (torch.Tensor): Q-value from the first critic for (state, action).
+                    q2_value (torch.Tensor): Q-value from the second critic for (state, action).
+                    q1_policy_value (torch.Tensor): Q-value from the first critic for (state, policy action).
+                    q2_policy_value (torch.Tensor): Q-value from the second critic for (state, policy action).
+                If `action_input` is not provided:
+                    squashed_mean (torch.Tensor): Mean of the action distribution after squashing.
+                    squashed_action (torch.Tensor): Sampled action after squashing.
+                    adjusted_log_prob (torch.Tensor): Log-probability of the sampled action.
+                    q1_policy_value (torch.Tensor): Q-value from the first critic for (state, policy action).
+                    q2_policy_value (torch.Tensor): Q-value from the second critic for (state, policy action).
+        Notes:
+            - The actor network outputs are squashed using a tanh function to ensure actions are within bounds.
+            - Critic networks estimate Q-values for both the policy action and optionally provided actions.
+        """
+
+        # ============= Actor网络(策略网络) =============
+        action_mean, sampled_action, log_action_prob = self.policy_network(state_input)
+        # 应用tanh压缩到有界动作空间
+        squashed_mean, squashed_action, adjusted_log_prob = apply_squashing_func(action_mean, sampled_action, log_action_prob)
+        # ============= Critic网络(价值网络) =============
+        # 共享CNN特征提取
+        extracted_features = self.shared_cnn_dense(state_input)  # 提取136维特征
+        # 计算当前策略下的Q值
+        q1_policy_value = self.q_network_1(torch.cat([extracted_features, squashed_action], dim=-1)).squeeze(-1)    # Q1(s,π(s))
+        q2_policy_value = self.q_network_2(torch.cat([extracted_features, squashed_action], dim=-1)).squeeze(-1)    # Q2(s,π(s))
+        if action_input is not None:
+            # 如果提供了动作，计算Q(s,a)
+            q1_value = self.q_network_1(torch.cat([extracted_features, action_input], dim=-1)).squeeze(-1)        # Q1(s,a)
+            q2_value = self.q_network_2(torch.cat([extracted_features, action_input], dim=-1)).squeeze(-1)        # Q2(s,a)
+            return squashed_mean, squashed_action, adjusted_log_prob, q1_value, q2_value, q1_policy_value, q2_policy_value
+        else:
+            return squashed_mean, squashed_action, adjusted_log_prob, q1_policy_value, q2_policy_value
+
+    def projection(
+        self,
+        state: torch.Tensor,
+        rewards: torch.Tensor,
+        bootstrap: torch.Tensor,
+        discount: float,
+    ) -> torch.Tensor:
+        """Projection operation that includes q_support directly"""
+        actions = self.policy_network(state)
+        q1_proj = self.q_network_1.projection(
+            state,
+            actions,
+            rewards,
+            bootstrap,
+            discount,
+            self.q_support,
+            self.q_support.device,
+        )
+        q2_proj = self.q_network_2.projection(
+            state,
+            actions,
+            rewards,
+            bootstrap,
+            discount,
+            self.q_support,
+            self.q_support.device,
+        )
+        return q1_proj, q2_proj
+
+    def critic_forward(self, state: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        return self.q_network_1(state, actions), self.q_network_2(state, actions)
+
+    def get_value(self, probs: torch.Tensor) -> torch.Tensor:
+        """Calculate value from logits using support"""
+        return torch.sum(probs * self.q_support, dim=1)
+
 
 class DCLP:
     """
-    Distributional Categorical Learning Policy (DCLP) Algorithm
+    DCLP Algorithm
     
-    This class implements the DCLP training algorithm for reinforcement learning
-    with distributional Q-learning and categorical policy networks.
+    This class implements the DCLP training algorithm for reinforcement learning.
     """
 
     def __init__(self, state_dim, action_dim, actor_lr=1e-4, critic_lr=1e-4, gamma=0.99, tau=0.005,
-                 alpha=0.2, hidden_sizes=(128, 128, 128, 128), device='cuda'):
+                 alpha=0.2, hidden_sizes=(128, 128, 128, 128), use_grad_norm_clipping=True, max_grad_norm=1.0, device='cuda'):
         """
         Initialize DCLP algorithm
         Args:
@@ -255,7 +394,10 @@ class DCLP:
         self.gamma = gamma
         self.tau = tau
         self.alpha = alpha
+        self.use_grad_norm_clipping = use_grad_norm_clipping
+        self.max_grad_norm = max_grad_norm
         self.device = device
+        
         self.actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
         self.target_actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
         self.update_target_network(tau=self.tau)
@@ -272,16 +414,13 @@ class DCLP:
             if deterministic:
                 # Use mean action for deterministic policy
                 action_mean, _, _, _, _ = self.actor_critic(state)
-                # action = torch.tanh(action_mean)
-                # print(f"Deterministic action mean: {action_mean}")
-                wheel_speeds = self.map_velocities_to_wheel_speeds(action_mean)
-                return wheel_speeds
+
+                return action_mean
             else:
                 # Sample action from policy
                 _, sampled_action, _, _, _ = self.actor_critic(state)
-                # print(f"Stochastic sampled action: {sampled_action}")
-                wheel_speeds = self.map_velocities_to_wheel_speeds(sampled_action)
-                return wheel_speeds
+
+                return sampled_action
 
     def update_target_network(self, tau=None):
         """Soft update of target network parameters"""
@@ -301,27 +440,37 @@ class DCLP:
         actions = torch.FloatTensor(batch['action']).to(self.device)
         rewards = torch.FloatTensor(batch['reward']).to(self.device)
         next_states = torch.FloatTensor(batch['next_state']).to(self.device)
-        dones = torch.BoolTensor(batch['done']).to(self.device)
+        dones = torch.BoolTensor(batch['done']).to(self.device) #FIXME?
 
-        # ============= Critic Update =============
+# ============= Critic Update =============
         with torch.no_grad():
             # Target actions from target policy
             _, _, next_log_probs, target_q1, target_q2 = self.target_actor_critic(next_states)
 
             # Take minimum and subtract entropy term
             target_q = torch.min(target_q1, target_q2) - self.alpha * next_log_probs
-            # target_q = rewards + (~dones) * self.gamma * target_q
-            target_q = rewards + self.gamma * target_q
-
+            target_q = rewards + (~dones) * self.gamma * target_q
+            # target_q = rewards + self.gamma * target_q
         # Current Q-values
         _, _, _, current_q1, current_q2, _, _ = self.actor_critic(states, actions)
-
         # Critic loss
         critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
 
         # Update critic
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+
+        # --- 新增: 计算 Critic Grad Norm ---
+        if self.use_grad_norm_clipping:
+            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                list(self.actor_critic.shared_cnn_dense.parameters()) +
+                list(self.actor_critic.q_network_1.parameters()) +
+                list(self.actor_critic.q_network_2.parameters()),
+                max_norm=self.max_grad_norm
+            )
+        else:
+            critic_grad_norm = torch.tensor(0.0, device=self.device)
+            
         self.critic_optimizer.step()
 
         # 冻结Q网络参数，只更新策略网络
@@ -332,22 +481,26 @@ class DCLP:
         for param in self.actor_critic.shared_cnn_dense.parameters():
             param.requires_grad = False
 
-        # ============= Actor Update =============
-        # Get current policy actions and Q-values
-        _, _, log_probs, _, _ = self.actor_critic(states)
-        with torch.no_grad():
-            _, _, _, policy_q1, policy_q2 = self.actor_critic(states)
-
+# ============= Actor Update =============
+        _, _, log_probs, policy_q1, policy_q2 = self.actor_critic(states)
         policy_q = torch.min(policy_q1, policy_q2)
-
-        # Actor loss (negative because we want to maximize Q)
         actor_loss = (self.alpha * log_probs - policy_q).mean()
 
         # Update actor
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
-        self.actor_optimizer.step()
+        
+        # --- 新增: 计算 Actor Grad Norm ---
+        if self.use_grad_norm_clipping:
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.actor_critic.policy_network.parameters(),
+                max_norm=self.max_grad_norm
+            )
+        else:
+            actor_grad_norm = torch.tensor(0.0, device=self.device)
 
+        self.actor_optimizer.step()
+        
         for param in self.actor_critic.q_network_1.parameters():
             param.requires_grad = True
         for param in self.actor_critic.q_network_2.parameters():
@@ -360,16 +513,16 @@ class DCLP:
 
         return {
             'actor_loss': actor_loss.item(),
-            'critic_loss': critic_loss.item(),
+            'qf_loss': critic_loss.item(), # --- 重命名 ---
+            # --- 新增 ---
+            'actor_grad_norm': actor_grad_norm.item(),
+            'critic_grad_norm': critic_grad_norm.item(),
+            # --- 保留 Q 值用于日志 ---
             'q1_mean': current_q1.mean().item(),
             'q2_mean': current_q2.mean().item(),
             'target_q_mean': target_q.mean().item(),
-            'policy_q1_mean': policy_q1.mean().item(),
-            'policy_q2_mean': policy_q2.mean().item(),
             'policy_q_mean': policy_q.mean().item(),
             'log_probs_mean': log_probs.mean().item(),
-            'entropy_term': (self.alpha * log_probs).mean().item(),
-            'alpha': self.alpha
         }
 
     def save(self, filepath):
@@ -389,48 +542,235 @@ class DCLP:
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
 
-    def map_velocities_to_wheel_speeds(
-        actions: torch.Tensor,
-        wheel_radius: float = 0.036,
-        wheel_base: float = 0.235
-    ) -> torch.Tensor:
+
+
+class FastDCLP:
+    """
+    FastDCLP Algorithm
+    
+    This class implements the FastDCLP training algorithm for reinforcement learning.
+    """
+
+    def __init__(self, state_dim, action_dim, actor_lr=1e-4, critic_lr=1e-4, gamma=0.99, tau=0.005,
+                 alpha=0.2, actor_hidden_sizes=(128, 128, 128, 128), critic_hidden_sizes=(128, 128, 128, 128), num_atoms=251, v_min=-100.0, v_max=100.0, use_grad_norm_clipping=True, max_grad_norm=1.0, device='cuda'):
         """
+        Initialize FastDCLP algorithm
         Args:
-            actions (torch.Tensor): 一个形状为 (num_envs, 2) 的张量。
-                                    每一行代表一个环境的动作，格式为 [linear_velocity, angular_velocity]。
-                                    - linear_velocity (v): 机器人的前进/后退速度 (m/s)。
-                                    - angular_velocity (ω): 机器人的旋转速度 (rad/s)。
-            wheel_radius (float): 机器人轮子的半径 (R)，单位为米 (m)。
-            wheel_base (float): 机器人左右轮之间的距离 (L)，也称为轮距，单位为米 (m)。
-        Returns:
-            torch.Tensor: 一个形状为 (num_envs, 2) 的张量。
-                        每一行代表对应环境下两个轮子的目标角速度，
-                        格式为 [left_wheel_angular_velocity, right_wheel_angular_velocity]。
-                        单位为 rad/s。
+            state_dim: Dimension of state space
+            action_dim: Dimension of action space
+            actor_lr: Learning rate for actor
+            critic_lr: Learning rate for critic
+            gamma: Discount factor
+            tau: Soft update parameter
+            alpha: Temperature parameter for entropy regularization
+            actor_hidden_sizes: Hidden layer sizes for actor network
+            critic_hidden_sizes: Hidden layer sizes for critic network
+            num_atoms: Number of atoms for distributional critic
+            v_min: Minimum value for support of distributional critic
+            v_max: Maximum value for support of distributional critic
+            use_grad_norm_clipping: Whether to use gradient norm clipping
+            max_grad_norm: Maximum norm for gradient clipping
+            device: Device to run on
         """
-        # 检查输入张量的形状
-        if actions.ndim != 2 or actions.shape[1] != 2:
-            raise ValueError(f"输入张量 'actions' 的形状应为 (num_envs, 2), 但得到的是 {actions.shape}")
-        # 从输入张量中解构线速度和角速度
-        # actions[:, 0] 是所有环境的线速度 v
-        # actions[:, 1] 是所有环境的角速度 ω
-        linear_velocity = actions[:, 0]
-        angular_velocity = actions[:, 1]
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.gamma = gamma
+        self.tau = tau
+        self.alpha = alpha
+        self.use_grad_norm_clipping = use_grad_norm_clipping
+        self.max_grad_norm = max_grad_norm
+        self.device = device
+        
 
-        # 应用运动学逆解公式
-        # v_l = v - (ω * L) / 2
-        # v_r = v + (ω * L) / 2
-        # 我们直接计算轮子的角速度 ω_wheel = v_wheel / R
-        # 注意：这里我们同时为所有环境计算结果，这是向量化的优势
+        # self.actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
+        # self.target_actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
+        self.actor_critic = MLPActorDistCritic(state_dim, action_dim, actor_hidden_sizes, critic_hidden_sizes, num_atoms=num_atoms, v_min=v_min, v_max=v_max).to(device)
+        self.target_actor_critic = MLPActorDistCritic(state_dim, action_dim, actor_hidden_sizes, critic_hidden_sizes, num_atoms=num_atoms, v_min=v_min, v_max=v_max).to(device)
+        self.update_target_network(tau=self.tau)
+        self.actor_optimizer = torch.optim.Adam(self.actor_critic.policy_network.parameters(), lr=actor_lr)
+        self.critic_optimizer = torch.optim.Adam(
+            list(self.actor_critic.shared_cnn_dense.parameters()) +
+            list(self.actor_critic.q_network_1.parameters()) +
+            list(self.actor_critic.q_network_2.parameters()), lr=critic_lr
+        )
 
-        # ω_left = (v - (ω * L) / 2) / R
-        omega_left = (linear_velocity - (angular_velocity * wheel_base) / 2.0) / wheel_radius
+    def get_action(self, state, deterministic=True):
+        """Get action from current policy"""
+        with torch.no_grad():
+            if deterministic:
+                # Use mean action for deterministic policy
+                action_mean, _, _, _, _ = self.actor_critic(state)
 
-        # ω_right = (v + (ω * L) / 2) / R
-        omega_right = (linear_velocity + (angular_velocity * wheel_base) / 2.0) / wheel_radius
+                return action_mean
+            else:
+                # Sample action from policy
+                _, sampled_action, _, _, _ = self.actor_critic(state)
 
-        # 将左右轮的角速度堆叠成一个 (num_envs, 2) 的张量并返回
-        # 使用 torch.stack 并指定维度 1，可以将两个 (num_envs,) 的张量合并成 (num_envs, 2)
-        wheel_speeds = torch.stack([omega_left, omega_right], dim=1)
+                return sampled_action
 
-        return wheel_speeds
+    def update_target_network(self, tau=None):
+        """Soft update of target network parameters"""
+        if tau is None:
+            tau = self.tau
+        for target_param, param in zip(self.target_actor_critic.parameters(),
+                                     self.actor_critic.parameters()):
+            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+
+    def train_step(self, data):
+        """
+        Single training step
+        Args:
+            data: Dictionary containing 'state', 'action', 'reward', 'next_state', 'done'
+        """
+
+        states = data["observations"]
+        next_states = data["next"]["observations"]
+        if envs.asymmetric_obs:
+            critic_states = data["critic_observations"]
+            next_critic_states = data["next"]["critic_observations"]
+        else:
+            critic_states = states
+            next_critic_states = next_states
+        actions = data["actions"]
+        rewards = data["next"]["rewards"]
+        dones = data["next"]["dones"].bool()
+        truncations = data["next"]["truncations"].bool()
+        if args.disable_bootstrap:
+            bootstrap = (~dones).float()
+        else:
+            bootstrap = (truncations & ~dones).float()  #Fixed
+        discount = args.gamma ** data["next"]["effective_n_steps"]
+
+
+        # =============Dist Critic Update =============
+        with torch.no_grad():
+            qf1_next_target_projected, qf2_next_target_projected = (
+                self.target_actor_critic.projection(
+                    next_critic_states,
+                    rewards,
+                    bootstrap,
+                    discount,
+                )
+            )
+            qf1_next_target_value = self.target_actor_critic.get_value(qf1_next_target_projected)
+            qf2_next_target_value = self.target_actor_critic.get_value(qf2_next_target_projected)
+            # if args.use_cdq:
+            qf_next_target_dist = torch.where(
+                qf1_next_target_value.unsqueeze(1)
+                < qf2_next_target_value.unsqueeze(1),
+                qf1_next_target_projected,
+                qf2_next_target_projected,
+            )
+            qf1_next_target_dist = qf2_next_target_dist = qf_next_target_dist
+            # else:
+            #     qf1_next_target_dist, qf2_next_target_dist = (
+            #         qf1_next_target_projected,
+            #         qf2_next_target_projected,
+            #     )
+
+            qf1, qf2 = self.actor_critic(critic_states, actions)
+            qf1_loss = -torch.sum(
+                qf1_next_target_dist * F.log_softmax(qf1, dim=1), dim=1
+            ).mean()
+            qf2_loss = -torch.sum(
+                qf2_next_target_dist * F.log_softmax(qf2, dim=1), dim=1
+            ).mean()
+            critic_loss = qf1_loss + qf2_loss
+        # with torch.no_grad():
+        #     # Target actions from target policy
+        #     _, _, next_log_probs, target_q1, target_q2 = self.target_actor_critic(next_states)
+
+        #     # Take minimum and subtract entropy term
+        #     target_q = torch.min(target_q1, target_q2) - self.alpha * next_log_probs
+        #     target_q = rewards + (~dones) * self.gamma * target_q
+        #     # target_q = rewards + self.gamma * target_q
+        # # Current Q-values
+        # _, _, _, current_q1, current_q2, _, _ = self.actor_critic(states, actions)
+        # # Critic loss
+        # critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
+
+        # Update critic
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+
+        # --- 新增: 计算 Critic Grad Norm ---
+        if self.use_grad_norm_clipping:
+            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                list(self.actor_critic.shared_cnn_dense.parameters()) +
+                list(self.actor_critic.q_network_1.parameters()) +
+                list(self.actor_critic.q_network_2.parameters()),
+                max_norm=self.max_grad_norm
+            )
+        else:
+            critic_grad_norm = torch.tensor(0.0, device=self.device)
+            
+        self.critic_optimizer.step()
+
+        # 冻结Q网络参数，只更新策略网络
+        for param in self.actor_critic.q_network_1.parameters():
+            param.requires_grad = False
+        for param in self.actor_critic.q_network_2.parameters():
+            param.requires_grad = False
+        for param in self.actor_critic.shared_cnn_dense.parameters():
+            param.requires_grad = False
+
+# ============= Actor Update =============
+        _, _, log_probs, policy_q1, policy_q2 = self.actor_critic(states)
+        policy_q = torch.min(policy_q1, policy_q2)
+        actor_loss = (self.alpha * log_probs - policy_q).mean()
+
+        # Update actor
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        
+        # --- 新增: 计算 Actor Grad Norm ---
+        if self.use_grad_norm_clipping:
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.actor_critic.policy_network.parameters(),
+                max_norm=self.max_grad_norm
+            )
+        else:
+            actor_grad_norm = torch.tensor(0.0, device=self.device)
+
+        self.actor_optimizer.step()
+        
+        for param in self.actor_critic.q_network_1.parameters():
+            param.requires_grad = True
+        for param in self.actor_critic.q_network_2.parameters():
+            param.requires_grad = True
+        for param in self.actor_critic.shared_cnn_dense.parameters():
+            param.requires_grad = True
+
+        # Update target network
+        self.update_target_network(tau=self.tau)
+
+        return {
+            'actor_loss': actor_loss.item(),
+            'qf_loss': critic_loss.item(), # --- 重命名 ---
+            # --- 新增 ---
+            'actor_grad_norm': actor_grad_norm.item(),
+            'critic_grad_norm': critic_grad_norm.item(),
+            # --- 保留 Q 值用于日志 ---
+            'q1_mean': current_q1.mean().item(),
+            'q2_mean': current_q2.mean().item(),
+            'target_q_mean': target_q.mean().item(),
+            'policy_q_mean': policy_q.mean().item(),
+            'log_probs_mean': log_probs.mean().item(),
+        }
+
+    def save(self, filepath):
+        """Save model parameters"""
+        torch.save({
+            'actor_critic': self.actor_critic.state_dict(),
+            'target_actor_critic': self.target_actor_critic.state_dict(),
+            'actor_optimizer': self.actor_optimizer.state_dict(),
+            'critic_optimizer': self.critic_optimizer.state_dict(),
+        }, filepath)
+
+    def load(self, filepath):
+        """Load model parameters"""
+        checkpoint = torch.load(filepath, map_location=self.device)
+        self.actor_critic.load_state_dict(checkpoint['actor_critic'])
+        self.target_actor_critic.load_state_dict(checkpoint['target_actor_critic'])
+        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
+        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])

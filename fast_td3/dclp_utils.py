@@ -300,6 +300,69 @@ class MLP(nn.Module):
                     output_tensor = self.output_activation(output_tensor)
         return output_tensor
 
+class DistributionalQNetwork(MLP):
+    def __init__(
+        self,
+        hidden_dim: int,
+        input_dim: int,
+        hidden_sizes: list,
+        activation=F.leaky_relu,
+        output_activation=None,
+        num_atoms: int = 251,
+        v_min: float = -100.0,
+        v_max: float = 100.0,
+    ):
+        super().__init__(input_dim, hidden_sizes, activation, output_activation)
+        self.v_min = v_min
+        self.v_max = v_max
+        self.num_atoms = num_atoms
+
+    def projection(
+        self,
+        obs: torch.Tensor,
+        actions: torch.Tensor,
+        rewards: torch.Tensor,
+        bootstrap: torch.Tensor,
+        discount: float,
+        q_support: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1)
+        batch_size = rewards.shape[0]
+
+        target_z = (
+            rewards.unsqueeze(1)
+            + bootstrap.unsqueeze(1) * discount.unsqueeze(1) * q_support
+        )
+        target_z = target_z.clamp(self.v_min, self.v_max)
+        b = (target_z - self.v_min) / delta_z
+        l = torch.floor(b).long()
+        u = torch.ceil(b).long()
+
+        l_mask = torch.logical_and((u > 0), (l == u))
+        u_mask = torch.logical_and((l < (self.num_atoms - 1)), (l == u))
+
+        l = torch.where(l_mask, l - 1, l)
+        u = torch.where(u_mask, u + 1, u)
+
+        next_dist = F.softmax(self.forward(obs, actions), dim=1)
+        proj_dist = torch.zeros_like(next_dist)
+        offset = (
+            torch.linspace(
+                0, (batch_size - 1) * self.num_atoms, batch_size, device=device
+            )
+            .unsqueeze(1)
+            .expand(batch_size, self.num_atoms)
+            .long()
+        )
+        proj_dist.view(-1).index_add_(
+            0, (l + offset).view(-1), (next_dist * (u.float() - b)).view(-1)
+        )
+        proj_dist.view(-1).index_add_(
+            0, (u + offset).view(-1), (next_dist * (b - l.float())).view(-1)
+        )
+        return proj_dist
+
 def calculate_turtlebot_velocities(omega_left_rad_s, omega_right_rad_s):
     """
     根据左右轮角速度计算TurtleBot2的线速度和角速度。
@@ -335,6 +398,10 @@ class DCLPArgs:
     env_name: str = "Isaac-Navigation-Flat-Turtlebot2-v0"
     """IsaacLab environment name"""
 
+    #GUI / rendering
+    headless: bool = True
+    render_mode: str = "human"
+
     # Training
     seed: int = 42
     """Random seed"""
@@ -350,6 +417,8 @@ class DCLPArgs:
     """Agent type"""
     gamma: float = 0.99
     """Discount factor"""
+    num_steps: int = 8
+    """the number of steps to use for the multi-step return"""
     tau: float = 0.005
     """Target network soft update rate"""
     batch_size: int = 4096
@@ -370,6 +439,10 @@ class DCLPArgs:
     """Critic final learning rate"""
 
     # Network architecture
+    narrow_layers: bool = True
+    """Use narrow layers as FastTD3"""
+    num_hidden_layers: int = 4
+    """Number of hidden layers"""
     actor_hidden_dim: int = 128
     """Actor hidden dimension"""
     critic_hidden_dim: int = 128
@@ -386,6 +459,14 @@ class DCLPArgs:
     """Policy update frequency"""
     num_updates: int = 1
     """Number of updates per step"""
+
+    # Distributional Critic 
+    num_atoms: int = 251
+    """Number of atoms for distributional critic"""
+    v_min: float = -100.0
+    """Minimum value for distributional critic"""
+    v_max: float = 100.0
+    """Maximum value for distributional critic"""
 
     # Normalization
     obs_normalization: bool = False
@@ -412,7 +493,7 @@ class DCLPArgs:
     """Compile mode"""
     weight_decay: float = 0.0
     """Weight decay"""
-    use_grad_norm_clipping: bool = False
+    use_grad_norm_clipping: bool = True
     """Use gradient norm clipping"""
     max_grad_norm: float = 0.5
     """Maximum gradient norm"""
@@ -430,7 +511,7 @@ class DCLPArgs:
     """Model save interval"""
 
     # Environment specific
-    action_bounds: float = None
+    action_bounds: Optional[float] = None
     """Action bounds scaling"""
     max_episode_steps: Optional[int] = None
     """Maximum episode steps override"""
@@ -442,3 +523,14 @@ class DCLPArgs:
     """LiDAR features per point (sin, cos, distance)"""
     use_cnn_features: bool = True
     """Use CNN for LiDAR feature extraction"""
+
+    def __post_init__(self):
+        # Sanitize render_mode to handle Windows cmd single quotes and curly quotes
+        if isinstance(self.render_mode, str):
+            rm = self.render_mode.strip()
+            # Strip common quote characters and whitespace
+            rm = rm.strip("'\"“”")
+            if rm.lower() in ("none", ""):
+                self.render_mode = None
+            else:
+                self.render_mode = rm

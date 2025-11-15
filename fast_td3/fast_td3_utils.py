@@ -50,7 +50,7 @@ class SimpleReplayBuffer(nn.Module):
         self.gamma = gamma
         self.n_steps = n_steps
         self.device = device
-        # print(f"n_env: {n_env}, buffer_size: {buffer_size}, n_obs: {n_obs}, n_act: {n_act}, n_critic_obs: {n_critic_obs}, asymmetric_obs: {asymmetric_obs}, playground_mode: {playground_mode}, n_steps: {n_steps}, gamma: {gamma}, device: {device}\n")
+        print(f"n_env: {n_env}, buffer_size: {buffer_size}, n_obs: {n_obs}, n_act: {n_act}, n_critic_obs: {n_critic_obs}, asymmetric_obs: {asymmetric_obs}, playground_mode: {playground_mode}, n_steps: {n_steps}, gamma: {gamma}, device: {device}\n")
         """
         n_env: 1024, buffer_size: 10240, n_obs: 1090,
         n_act: 2, n_critic_obs: 1090, asymmetric_obs: False,
