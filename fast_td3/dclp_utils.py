@@ -303,7 +303,6 @@ class MLP(nn.Module):
 class DistributionalQNetwork(MLP):
     def __init__(
         self,
-        hidden_dim: int,
         input_dim: int,
         hidden_sizes: list,
         activation=F.leaky_relu,
@@ -344,8 +343,7 @@ class DistributionalQNetwork(MLP):
 
         l = torch.where(l_mask, l - 1, l)
         u = torch.where(u_mask, u + 1, u)
-
-        next_dist = F.softmax(self.forward(obs, actions), dim=1)
+        next_dist = F.softmax(self.forward(torch.cat([obs, actions], dim=1)), dim=1)
         proj_dist = torch.zeros_like(next_dist)
         offset = (
             torch.linspace(
@@ -429,13 +427,13 @@ class DCLPArgs:
     """Entropy regularization coefficient"""
 
     # Learning rates
-    actor_learning_rate: float = 1e-4
+    actor_learning_rate: float = 2e-4
     """Actor learning rate"""
-    critic_learning_rate: float = 1e-4
+    critic_learning_rate: float = 2e-4
     """Critic learning rate"""
-    actor_learning_rate_end: float = 1e-5
+    actor_learning_rate_end: float = 2e-4
     """Actor final learning rate"""
-    critic_learning_rate_end: float = 1e-5
+    critic_learning_rate_end: float = 2e-4
     """Critic final learning rate"""
 
     # Network architecture
@@ -450,14 +448,14 @@ class DCLPArgs:
     init_scale: float = 0.01
     """Actor initialization scale"""
 
-    # TD3 specific
+    # FastTD3 specific
     policy_noise: float = 0.1
     """Policy noise for target smoothing"""
     noise_clip: float = 0.5
     """Noise clipping for target smoothing"""
     policy_frequency: int = 2
     """Policy update frequency"""
-    num_updates: int = 1
+    num_updates: int = 4
     """Number of updates per step"""
 
     # Distributional Critic 
@@ -471,7 +469,7 @@ class DCLPArgs:
     # Normalization
     obs_normalization: bool = False
     """Use observation normalization"""
-    reward_normalization: bool = False
+    reward_normalization: bool = True
     """Use reward normalization"""
 
     # Hardware
@@ -485,7 +483,7 @@ class DCLPArgs:
     # Optimization
     amp: bool = True
     """Use automatic mixed precision"""
-    amp_dtype: str = "fp16"
+    amp_dtype: str = "bf16"
     """AMP dtype (bf16 or fp16)"""
     compile: bool = True
     """Compile model with torch.compile"""
@@ -498,13 +496,15 @@ class DCLPArgs:
     max_grad_norm: float = 0.5
     """Maximum gradient norm"""
 
-    # Logging
+    # Logging & Visualizing
     use_wandb: bool = True
     """Use Weights & Biases logging"""
-    project: str = "DCLP-IsaacLab"
+    project: str = "FastDCLP-IsaacLab"
     """W&B project name"""
     exp_name: str = "dclp_training"
     """Experiment name"""
+    log_interval: int = 100
+    """Logging interval"""
     eval_interval: int = 100000
     """Evaluation interval"""
     save_interval: int = 100000
@@ -517,10 +517,6 @@ class DCLPArgs:
     """Maximum episode steps override"""
 
     # DCLP specific
-    lidar_points: int = 90
-    """Number of LiDAR points (270/3)"""
-    lidar_features: int = 3
-    """LiDAR features per point (sin, cos, distance)"""
     use_cnn_features: bool = True
     """Use CNN for LiDAR feature extraction"""
 

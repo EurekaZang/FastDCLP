@@ -385,11 +385,11 @@ def main():
                     normalized_next_obs = next_observations
 
                 batch = {
-                    'state': normalized_obs.cpu().numpy(),
-                    'action': actions_batch.cpu().numpy(),
-                    'reward': rewards_batch.cpu().numpy(),
-                    'next_state': normalized_next_obs.cpu().numpy(),
-                    'done': dones_batch.cpu().numpy()
+                    'state': normalized_obs,
+                    'action': actions_batch,
+                    'reward': rewards_batch,
+                    'next_state': normalized_next_obs,
+                    'done': dones_batch
                 }
 
                 # Train DCLP 并获取指标

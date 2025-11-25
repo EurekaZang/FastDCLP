@@ -105,7 +105,7 @@ class SimpleReplayBuffer(nn.Module):
                 self.next_critic_observations = torch.zeros(
                     (n_env, buffer_size, n_critic_obs), device=device, dtype=torch.float16
                 )
-        print("asymmetric_obs success")
+            print("asymmetric_obs success")
         self.ptr = 0
     
     @property

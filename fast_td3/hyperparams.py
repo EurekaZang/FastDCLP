@@ -433,10 +433,8 @@ class LeapCubeRotateZAxisArgs(MuJoCoPlaygroundArgs):
 class IsaacLabArgs(BaseArgs):
     v_min: float = -10.0
     v_max: float = 10.0
-    buffer_size: int = 1024 * 5
-    # buffer_size: int = 1024 * 10
-    num_envs: int = 1024
-    # num_envs: int = 4096
+    buffer_size: int = 1024 * 10
+    num_envs: int = 4096
     num_eval_envs: int = 4096
     action_bounds: float = 1.0
     std_max: float = 0.4

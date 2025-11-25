@@ -6,8 +6,7 @@ This script trains the DCLP model using FastTD3 algorithm
 with IsaacLab navigation environments. It's optimized for efficient training with LiDAR data.
 
 Usage:
-    python train_fast_dclp_isaac_lab.py --env_name Isaac-Navigation-Flat-Jackal-v0     --num_envs 4 --buffer_size 5120 --batch_size 32     --lidar_points 90     --actor_hidden_dim 256 --critic_hidden_dim 256     --learning_starts 10000 --total_timesteps 500000   --exp_name "try_training" --no-headless
-"""
+python fast_td3/train_fastdclp_isaac_lab.py --env_name Isaac-Navigation-Flat-Jackal-v0     --num_envs 16 --buffer_size 5120 --batch_size 32        --actor_hidden_dim 256 --critic_hidden_dim 256     --learning_starts 10000 --total_timesteps 500000   --exp_name "try_training_real_fastdclp" --no-headless --project "FastDCLP-IsaacLab"  """ 
 
 import os
 import sys
@@ -64,12 +63,15 @@ def main():
 
     run_name = f"{args.env_name}__{args.exp_name}__{args.seed}"
 
-    # Setup mixed precision
-    amp_enabled = False
-    amp_device_type = "cpu"
-    amp_dtype = torch.float32
+    amp_enabled = args.amp and args.cuda and torch.cuda.is_available()
+    amp_device_type = (
+        "cuda"
+        if args.cuda and torch.cuda.is_available()
+        else "mps" if args.cuda and torch.backends.mps.is_available() else "cpu"
+    )
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
 
-    # Initialize W&B
+    scaler = GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
     if args.use_wandb:
         wandb.init(
             project=args.project,
@@ -138,15 +140,24 @@ def main():
         gamma=args.gamma,
         tau=args.tau,
         alpha=args.alpha,
-        hidden_sizes=(args.actor_hidden_dim, args.actor_hidden_dim, args.actor_hidden_dim, args.actor_hidden_dim),
-        critic_hidden_sizes=(args.critic_hidden_dim for _ in range(args.num_hidden_layers)),
+        actor_hidden_sizes=[args.actor_hidden_dim for _ in range(args.num_hidden_layers)],
+        critic_hidden_sizes=[args.critic_hidden_dim for _ in range(args.num_hidden_layers)],
         num_atoms=args.num_atoms,
         v_min=args.v_min,
         v_max=args.v_max,
         use_grad_norm_clipping=args.use_grad_norm_clipping,
         max_grad_norm=args.max_grad_norm,
-        device=device
+        device=device,
+        scalar = scaler,
+        amp_enabled=amp_enabled,
+        amp_device_type=amp_device_type,
+        amp_dtype=amp_dtype,
+        compile_mode=args.compile_mode,
+        policy_frequency=args.policy_frequency,
     )
+
+    if args.compile:
+        dclp.enable_compile()
 
     print("DCLP network initialized successfully")
     print("Optimizers and schedulers initialized successfully")
@@ -154,13 +165,13 @@ def main():
     q_scheduler = optim.lr_scheduler.CosineAnnealingLR(
         dclp.critic_optimizer,
         T_max=args.total_timesteps,
-        eta_min=torch.tensor(args.critic_learning_rate_end, device=device),
+        eta_min=args.critic_learning_rate_end,
     )
     print("Q-scheduler initialized successfully")
     actor_scheduler = optim.lr_scheduler.CosineAnnealingLR(
         dclp.actor_optimizer,
         T_max=args.total_timesteps,
-        eta_min=torch.tensor(args.actor_learning_rate_end, device=device),
+        eta_min=args.actor_learning_rate_end,
     )
     print("Actor-scheduler initialized successfully")
 
@@ -175,71 +186,48 @@ def main():
         playground_mode=False,
         n_steps=args.num_steps,
         gamma=args.gamma,
-        device=device,
+        device=device,     #torch.device("cpu"),
     )
     print("Replay buffer initialized successfully")
     #FIXME: Any problem?
     def evaluate():
         """Evaluation function"""
         print("Running evaluation...")
-        print(f"Max episode steps: {envs.max_episode_steps}")
-        print(f"Number of environments: {envs.num_envs}")
-        eval_returns = []
-        eval_lengths = []
-        num_eval_episodes = min(3, args.num_envs)
-        eval_pbar = tqdm.tqdm(range(num_eval_episodes), desc="🔍 Evaluation Episodes", leave=False)
-        for evaluate_episode in eval_pbar:
-            obs = envs.reset(random_start_init=False)
-            episode_return = 0.0
-            episode_length = 0
-            print(f"\nStarting evaluation episode {evaluate_episode+1}")
-            max_eval_steps = min(1000, envs.max_episode_steps)
-            step_pbar = tqdm.tqdm(range(max_eval_steps),
-                                desc=f"Episode {evaluate_episode+1}/{num_eval_episodes}",
-                                leave=False)
-            with torch.no_grad():
-                for step in step_pbar:
-                    if args.obs_normalization:
-                        norm_obs = obs_normalizer(obs, update=False)
-                    else:
-                        norm_obs = obs
-                    actions = dclp.get_action(norm_obs)
-                    obs, reward, done, info = envs.step(actions)
-                    episode_return += reward.mean().item()
-                    episode_length += 1
-                    # Update step progress bar with current reward
-                    step_pbar.set_postfix({
-                        'Return': f'{episode_return:.2f}',
-                        'Reward': f'{reward.mean().item():.3f}',
-                        'Length': episode_length,
-                        'Done': done.sum().item()
-                    })
-                    if done[0]:
-                        print(f"Episode {evaluate_episode+1} finished at step {episode_length} (done=True)")
-                        break
-                    if episode_length >= max_eval_steps:
-                        print(f"Episode {evaluate_episode+1} truncated at {max_eval_steps} steps for faster evaluation")
-                        break
-                    if episode_length % 1000 == 0:
-                        print(f"Episode {evaluate_episode+1}: Step {episode_length}, Return: {episode_return:.2f}, Last Reward: {reward.mean().item():.3f}")
-            step_pbar.close()
-            eval_returns.append(episode_return)
-            eval_lengths.append(episode_length)
-            eval_pbar.set_postfix({
-                'Avg Return': f'{np.mean(eval_returns):.2f}',
-                'Avg Length': f'{np.mean(eval_lengths):.1f}'
-            })
-        eval_pbar.close()
-        mean_return = np.mean(eval_returns)
-        mean_length = np.mean(eval_lengths)
-        print(f"Eval: Mean Return = {mean_return:.2f}, Mean Length = {mean_length:.1f}")
-        if args.use_wandb:
-            wandb.log({
-                "eval/mean_return": mean_return,
-                "eval/mean_length": mean_length,
-            })
-        
-        return mean_return
+        num_eval_envs = envs.num_envs
+        episode_returns = torch.zeros(num_eval_envs, device=device)
+        episode_lengths = torch.zeros(num_eval_envs, device=device)
+        done_masks = torch.zeros(num_eval_envs, dtype=torch.bool, device=device)
+
+
+
+        obs = envs.reset(random_start_init=False)
+
+        print(f"\nStarting evaluation episode {evaluate_episode+1}")
+        max_eval_steps = envs.max_episode_steps
+        step_pbar = tqdm.tqdm(range(max_eval_steps),
+                            desc=f"Episode {evaluate_episode+1}/{num_eval_episodes}",
+                            leave=False)
+        for step in step_pbar:
+            with torch.no_grad(), autocast(
+                device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
+            ):              
+                norm_obs = obs_normalizer(obs, update=False)
+                actions = dclp.get_action(norm_obs)
+            next_obs, rewards, dones, infos = envs.step(actions.float())
+            episode_returns = torch.where(
+                ~done_masks, episode_returns + rewards, episode_returns
+            )
+            episode_lengths = torch.where(
+                ~done_masks, episode_lengths + 1, episode_lengths
+            )
+            if env_type == "mtbench" and "episode" in infos:
+                dones = dones | infos["episode"]["success"]
+            done_masks = torch.logical_or(done_masks, dones)
+            if done_masks.all():
+                break
+            obs = next_obs
+
+        return episode_returns.mean().item(), episode_lengths.mean().item()
 
     # Log hyperparameters to W&B
     if args.use_wandb:
@@ -267,39 +255,66 @@ def main():
 
 
     # Training loop
+    if args.compile:
+        normalize_obs = torch.compile(obs_normalizer.forward, mode=None)
+        normalize_critic_obs = torch.compile(critic_obs_normalizer.forward, mode=None)
+        if args.reward_normalization:
+            update_stats = torch.compile(reward_normalizer.update_stats, mode=None)
+        normalize_reward = torch.compile(reward_normalizer.forward, mode=None)
+    else:
+        normalize_obs = obs_normalizer.forward
+        normalize_critic_obs = critic_obs_normalizer.forward
+        if args.reward_normalization:
+            update_stats = reward_normalizer.update_stats
+        normalize_reward = reward_normalizer.forward
+
     global_step = 0
+    total_eps = 0
+    total_success = 0
+    window_eps_log = args.log_interval
+    window_eps_acc = 0
+    window_succ_acc = 0
+
     obs = envs.reset(random_start_init=False)
     dones = torch.zeros(args.num_envs, dtype=torch.bool, device=device)
     pbar = tqdm.tqdm(total=args.total_timesteps, initial=global_step)
+    start_time = None
     start_time = time.time()
     print("🚀 Starting DCLP training...")
-    #TODO: Check the logic
+
     while global_step < args.total_timesteps:
-        with torch.no_grad():
+        with torch.no_grad(), autocast(
+            device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
+        ):
             if global_step < args.learning_starts:
                 actions = torch.rand(args.num_envs, n_act, device=device) * 2 - 1
             else:
                 if args.obs_normalization:
-                    norm_obs = obs_normalizer(obs, update=False)
+                    norm_obs = normalize_obs(obs, update=False)
                 else:
                     norm_obs = obs
                 actions = dclp.get_action(norm_obs)
-                print("debug actions",actions)
-                wandb.log({
-                    "env0_linear_action": actions[0][0] * 10,
-                    "env0_angular_action": actions[0][1] * 10,
-                })
-        next_obs, rewards, next_dones, infos = envs.step(actions)
-        if hasattr(reward_normalizer, 'update_stats'):
-            reward_normalizer.update_stats(rewards, next_dones)
-        normalized_rewards = reward_normalizer(rewards) # If --reward-normalization = False, this is identity
+
+        next_obs, rewards, dones, infos = envs.step(actions)
+        truncations = infos["time_outs"]
+        successes = infos["successes"]
+        eps = int(dones.sum().item())
+        succ = int(successes.sum().item())
+        total_eps += eps
+        total_success += succ
+        window_eps_acc += eps
+        window_succ_acc += succ
+        batch_rate = succ / max(1, eps) if eps > 0 else None
+        ema_success_rate = ema_success_rate * 0.95 + 0.05 * batch_rate if "ema" in locals() else batch_rate
         
+        if args.reward_normalization:
+            update_stats(rewards, dones.float())     
         # if envs.asymmetric_obs:
         #     next_critic_obs = infos["observations"]["critic"]
         # # Compute 'true' next_obs and next_critic_obs for saving
-        # true_next_obs = torch.where(
-        #     dones[:, None] > 0, infos["observations"]["raw"]["obs"], next_obs
-        # )
+        true_next_obs = torch.where(
+            dones[:, None] > 0, infos["observations"]["raw"]["obs"], next_obs
+        )
         # if envs.asymmetric_obs:
         #     true_next_critic_obs = torch.where(
         #         dones[:, None] > 0,
@@ -307,59 +322,37 @@ def main():
         #         next_critic_obs,
         #     )
 
-        tensor_dict = TensorDict({
-            "observations": obs,
-            "actions": actions,
-            "critic_observations": obs if not envs.asymmetric_obs else obs,
-            "next": TensorDict({
-                "observations": next_obs,
-                "critic_observations": next_obs if not envs.asymmetric_obs else next_obs,
-                "rewards": normalized_rewards,
-                "dones": dones,
-                "truncations": next_dones,
-            })
-        })
-        rb.extend(tensor_dict)
+        transition = TensorDict(
+            {
+                "observations": obs,
+                "actions": torch.as_tensor(actions, device=device, dtype=torch.float),
+                "next": {
+                    "observations": true_next_obs,
+                    "rewards": torch.as_tensor(
+                        rewards, device=device, dtype=torch.float
+                    ),
+                    "truncations": truncations.long(),
+                    "dones": dones.long(),
+                },
+            },
+            batch_size=(envs.num_envs,),
+            device=device,
+        )
+        
+        rb.extend(transition)
+        # rb.extend(transition.to(device))
         # Update normalizers
-        if args.obs_normalization:
-            obs_normalizer(obs)
-            critic_obs_normalizer(obs)
+
+
         obs = next_obs
-        dones = next_dones
-        global_step += args.num_envs
         # Training updates
-        logs_dict = {} # 用于存储 *最后一次* 更新的指标
+        logs_dict = {}
         if global_step >= args.learning_starts:
-            for _ in range(args.num_updates):
-                # data = rb.sample(args.batch_size)
-                
-                # # --- 数据准备 (从 update_dclp 移入) ---
-                # observations = data["observations"].float()
-                # actions_batch = data["actions"]
-                # rewards_batch = data["next"]["rewards"]
-                # next_observations = data["next"]["observations"].float()
-                # dones_batch = data["next"]["dones"].bool()
-
-                # if args.obs_normalization:
-                #     normalized_obs = obs_normalizer(observations,  update=True)
-                #     normalized_next_obs = obs_normalizer(next_observations, update=False)
-                # else:
-                #     normalized_obs = observations
-                #     normalized_next_obs = next_observations
-
-                # batch = {
-                #     'state': normalized_obs.cpu().numpy(),
-                #     'action': actions_batch.cpu().numpy(),
-                #     'reward': rewards_batch.cpu().numpy(),
-                #     'next_state': normalized_next_obs.cpu().numpy(),
-                #     'done': dones_batch.cpu().numpy()
-                # }
-
-                # # Train DCLP 并获取指标
-                # logs_dict = dclp.train_step(batch)
-                # stay same with fasttd3
+            for i in range(args.num_updates):
                 data = rb.sample(max(1, args.batch_size // args.num_envs))
-                
+                # if rb.device is not None and getattr(rb.device, "type", None) == "cpu":
+                #     data = data.to(device)
+                # print("debug data device,338",data.device)
                 data["observations"] = normalize_obs(data["observations"])
                 data["next"]["observations"] = normalize_obs(
                     data["next"]["observations"]
@@ -372,85 +365,120 @@ def main():
                         data["next"]["critic_observations"]
                     )
                 raw_rewards = data["next"]["rewards"]
-
                 data["next"]["rewards"] = normalize_reward(raw_rewards)
 
                 # Train DCLP 并获取指标
-                logs_dict = dclp.train_step(data)
-                # 在优化器 step 完成后更新学习率调度器
-                q_scheduler.step()
-                actor_scheduler.step()
-                # 存储用于日志的 buffer 奖励
-                logs_dict["buffer_rewards"] = rewards_batch.mean().item()
+                result = dclp.train_step(data, i)
+                # Unpack tuple and extract scalars immediately
+                actor_loss, critic_loss, actor_grad_norm, critic_grad_norm, qf1, qf2, qf1_next_target_value, qf_next_target_dist, policy_qf_value, log_probs = result
+                
+                # Create logs dict with extracted values
+                logs_dict = {
+                    'actor_loss': actor_loss.detach() if actor_loss is not None else None,
+                    'qf_loss': critic_loss.detach(),
+                    'actor_grad_norm': actor_grad_norm.detach() if actor_grad_norm is not None else None,
+                    'critic_grad_norm': critic_grad_norm.detach(),
+                    'qf_max': qf1_next_target_value.max().detach(),
+                    'qf_min': qf1_next_target_value.min().detach(),
+                    'q1_max_value': qf1.argmax(dim=1).detach(),
+                    'q2_max_value': qf2.argmax(dim=1).detach(),
+                    'q1_min_value': qf1.argmin(dim=1).detach(),
+                    'q2_min_value': qf2.argmin(dim=1).detach(),
+                    'policy_q_mean': policy_qf_value.mean().detach() if policy_qf_value is not None else None,
+                    'log_probs_mean': log_probs.mean().detach() if log_probs is not None else None,
+                }
+            
+            # Update learning rate schedulers after optimizer steps
+            q_scheduler.step()
+            actor_scheduler.step()
             
             # --- 新增: 每 100 步记录一次日志 ---
-            if global_step % 100 == 0 and args.use_wandb:
+            if global_step % args.log_interval == 0 and args.use_wandb:
                 elapsed_time = time.time() - start_time
                 speed = global_step / elapsed_time if elapsed_time > 0 else 0
+                with torch.no_grad():
+                    wandb_logs = {
+                        "speed": speed,
+                        "frame": global_step * args.num_envs,
+                        "global_success_rate": total_success / max(1, total_eps),
+                        "ema_success_rate": ema_success_rate,
+                        "critic_lr": q_scheduler.get_last_lr()[0],
+                        "actor_lr": actor_scheduler.get_last_lr()[0],
+                        "env_rewards": rewards.mean(), # 'rewards' 是来自 env.step 的最新奖励
+                        
+                        # --- 添加来自 DCLP 的指标 ---
+                        # (使用 .get() 避免在 logs_dict 为空时出错)
+                        "actor_loss": logs_dict.get('actor_loss'),
+                        "qf_loss": logs_dict.get('qf_loss'),
+                        "actor_grad_norm": logs_dict.get('actor_grad_norm'),
+                        "critic_grad_norm": logs_dict.get('critic_grad_norm'),
+                        "buffer_rewards": raw_rewards.mean(),
+                        "qf_max": logs_dict.get('q1_mean'), # 使用 q1_mean 作为 qf_max 的代理
+                        "qf_min": logs_dict.get('q2_mean'), # 使用 q2_mean 作为 qf_min 的代理
+                        "policy_q_mean": logs_dict.get('policy_q_mean'),
+                        "target_q_mean": logs_dict.get('target_q_mean'),
+                        "log_probs_mean": logs_dict.get('log_probs_mean'),
+                        
+                        # --- 动作日志 ---
+                        "env0_linear_action": actions[0][0] * 10,
+                        "env0_angular_action": actions[0][1] * 10,
+                    }
 
-                wandb_logs = {
-                    "speed": speed,
-                    "frame": global_step * args.num_envs,
-                    "critic_lr": q_scheduler.get_last_lr()[0],
-                    "actor_lr": actor_scheduler.get_last_lr()[0],
-                    "env_rewards": rewards.mean().item(), # 'rewards' 是来自 env.step 的最新奖励
-                    
-                    # --- 添加来自 DCLP 的指标 ---
-                    # (使用 .get() 避免在 logs_dict 为空时出错)
-                    "actor_loss": logs_dict.get('actor_loss'),
-                    "qf_loss": logs_dict.get('qf_loss'),
-                    "actor_grad_norm": logs_dict.get('actor_grad_norm'),
-                    "critic_grad_norm": logs_dict.get('critic_grad_norm'),
-                    "buffer_rewards": logs_dict.get('buffer_rewards'),
-                    "qf_max": logs_dict.get('q1_mean'), # 使用 q1_mean 作为 qf_max 的代理
-                    "qf_min": logs_dict.get('q2_mean'), # 使用 q2_mean 作为 qf_min 的代理
-                    "policy_q_mean": logs_dict.get('policy_q_mean'),
-                    "target_q_mean": logs_dict.get('target_q_mean'),
-                    "log_probs_mean": logs_dict.get('log_probs_mean'),
-                    
-                    # --- 动作日志 ---
-                    "env0_linear_action": actions[0][0] * 10,
-                    "env0_angular_action": actions[0][1] * 10,
-                }
+                    if args.eval_interval > 0 and global_step % args.eval_interval == 0:
+                        print(f"Evaluating at global step {global_step}")
+                        eval_avg_return, eval_avg_length = evaluate()
+                        if env_type in ["humanoid_bench", "isaaclab", "mtbench"]:
+                            # NOTE: Hacky way of evaluating performance, but just works
+                            obs = envs.reset()
+                        wandb_logs["eval_avg_return"] = eval_avg_return
+                        wandb_logs["eval_avg_length"] = eval_avg_length
                 
                 # 过滤掉 None 值
                 wandb_logs = {k: v for k, v in wandb_logs.items() if v is not None}
-                wandb.log(wandb_logs, step=global_step)
-        # Periodic evaluation
-        if global_step % (args.eval_interval * args.num_envs) == 0 and global_step > 0:
-            evaluate()
+                if args.use_wandb:
+                    wandb.log(wandb_logs, step=global_step)
+
+            if window_eps_acc > window_eps_log:
+                if args.use_wandb:
+                    wandb.log({"window_success_rate": window_succ_acc / max(1, window_eps_acc)}, step=global_step)
+                else:
+                    print("window_success_rate", window_succ_acc / max(1, window_eps_acc))
+                window_eps_acc = 0
+                window_succ_acc = 0
+
+
         # Periodic model saving
         if global_step % args.save_interval == 0 and global_step > 0:
             os.makedirs("models", exist_ok=True)
             save_path = f"./models/{run_name}_{global_step}.pt"
             dclp.save(save_path)
-            print(f"Model saved to {save_path}")
             # Log model checkpoint to W&B
             if args.use_wandb:
                 artifact = wandb.Artifact(run_name, type="model")
                 artifact.add_file(save_path)
                 wandb.log_artifact(artifact)
         # Update progress bar
-        rewards = rewards.mean(dim=-1).item()
-        if global_step % (100 * args.num_envs) == 0:
+        rewards = rewards.mean().item()
+        if global_step % 100 == 0:
             elapsed_time = time.time() - start_time
             steps_per_sec = global_step / elapsed_time if elapsed_time > 0 else 0
             pbar.set_description(
                 f"step: {global_step},"
-                f"buffer: {rb.ptr}/{rb.size},"
+                f"buffer: {(rb.ptr % rb.size)}/{rb.size},"
                 f"reward: {rewards:.4f},"
                 f"SPS: {steps_per_sec:.2f}" # --- 添加 SPS 到 pbar ---
             )
-        pbar.update(args.num_envs)
-
+        pbar.update(1)
+        global_step += 1
 
     # Final evaluation and save
     print("🏁 Training completed!")
-    final_return = evaluate()
+    eval_avg_return, eval_avg_length = evaluate()
     os.makedirs("models", exist_ok=True)
     final_save_path = f"models/{run_name}_final.pt"
     dclp.save(final_save_path)
-    print(f"✅ Final evaluation return: {final_return:.2f}")
+    print(f"✅ Final evaluation return: {eval_avg_return:.2f}")
+    print(f"✅ Final evaluation length: {eval_avg_length:.2f}")
     print(f"💾 Model saved to: {final_save_path}")
     if args.use_wandb:
         wandb.finish()

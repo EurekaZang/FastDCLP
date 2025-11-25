@@ -3,7 +3,7 @@
 Fastdclp with DSAC
 
 Usage:
-    python train_dclp_isaac_lab.py --env_name Isaac-Navigation-Flat-Jackal-v0     --num_envs 32 --buffer_size 10240 --batch_size 32     --lidar_points 90     --actor_hidden_dim 256 --critic_hidden_dim 256     --learning_starts 10000 --total_timesteps 1000000   --exp_name "try_training_with_potential_reward" --no-headless
+    python train_dclp_isaac_lab.py --env_name Isaac-Navigation-Flat-Jackal-v0     --num_envs 4096 --buffer_size 10240 --batch_size 32768    --actor_hidden_dim 256 --critic_hidden_dim 256     --learning_starts 10000 --total_timesteps 1000000   --exp_name "try_training_real_fastdclp_with_entropy" --no-headless
 """
 
 import os

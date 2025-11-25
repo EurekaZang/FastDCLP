@@ -7,6 +7,7 @@ import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..', 'DCLP'))
 from dclp_utils import CNNNet, CNNDense, MLP
+from torch.amp import autocast
 
 EPS = 1e-8
 LOG_STD_MAX = 2
@@ -97,9 +98,18 @@ class MLPGaussianPolicy(nn.Module):
         # print(f"dclp.py:97  log_mixture_weights shape={log_mixture_weights.shape}  min={log_mixture_weights.min().item():.4f}  max={log_mixture_weights.max().item():.4f}  mean={log_mixture_weights.mean().item():.4f}  has_nan={torch.isnan(log_mixture_weights).any().item()}  has_inf={torch.isinf(log_mixture_weights).any().item()}")
         selected_component_idx = torch.multinomial(torch.softmax(log_mixture_weights, dim=-1), num_samples=1)  # 选择组件
         # 获取选中组件的参数
-        batch_indices = torch.arange(batch_size, device=state_input.device)
-        selected_component_mean = component_means[batch_indices, selected_component_idx.squeeze(-1)]      # 选中组件均值
-        selected_component_std = component_std_devs[batch_indices, selected_component_idx.squeeze(-1)] # 选中组件标准差
+        # batch_indices = torch.arange(batch_size, device=state_input.device)
+        # selected_component_mean = component_means[batch_indices, selected_component_idx.squeeze(-1)]      # 选中组件均值
+        # selected_component_std = component_std_devs[batch_indices, selected_component_idx.squeeze(-1)] # 选中组件标准差
+        
+        # FIXED CUDA GRAPHS
+        # Use torch.gather for better compatibility with torch.compile / CUDA Graphs
+        # component_means: [N, K, D], selected_component_idx: [N, 1]
+        # We want to gather along dim 1.
+        # Expand index to [N, 1, D]
+        gather_index = selected_component_idx.unsqueeze(-1).expand(-1, -1, self.action_dimension)
+        selected_component_mean = torch.gather(component_means, 1, gather_index).squeeze(1)
+        selected_component_std = torch.gather(component_std_devs, 1, gather_index).squeeze(1)
         # 重参数化采样：a = μ + σ * ε
         random_noise = torch.randn((batch_size, self.action_dimension), device=state_input.device)
         sampled_action = selected_component_mean + selected_component_std * random_noise
@@ -238,13 +248,14 @@ class MLPActorDistCritic(nn.Module):
             self,
             state_dim,
             action_dim,
-            actor_hidden_sizes=(128, 128, 128, 128),
-            critic_hidden_sizes=(128, 128, 128, 128),
+            actor_hidden_sizes=[128, 128, 128, 128],
+            critic_hidden_sizes=[128, 128, 128, 128],
             activation=F.leaky_relu,
             output_activation=F.leaky_relu,
             num_atoms=251,
             v_min=-100.0,
             v_max=100.0,
+            device="cuda",
             ):
         super(MLPActorDistCritic, self).__init__()
 
@@ -256,7 +267,7 @@ class MLPActorDistCritic(nn.Module):
         self.policy_network = MLPGaussianPolicy(
             state_dim,
             action_dim,
-            list(actor_hidden_sizes),
+            actor_hidden_sizes,
             activation,
             output_activation
             )
@@ -269,9 +280,11 @@ class MLPActorDistCritic(nn.Module):
         # CNN特征 128维 + 其他观测特征 (总观测维度 - 540) + 动作维度
         other_obs_dim = state_dim - 540  # 其他观测特征的维度
         q_network_input_dim = 128 + other_obs_dim + action_dim
-        self.q_network_1 = DistributionalQNetwork(q_network_input_dim, list(critic_hidden_sizes) + [num_atoms], activation, None, num_atoms, v_min, v_max)
-        self.q_network_2 = DistributionalQNetwork(q_network_input_dim, list(critic_hidden_sizes) + [num_atoms], activation, None, num_atoms, v_min, v_max)
-        
+        self.q_network_1 = DistributionalQNetwork(q_network_input_dim, critic_hidden_sizes + [num_atoms], activation, None, num_atoms, v_min, v_max)
+        self.q_network_2 = DistributionalQNetwork(q_network_input_dim, critic_hidden_sizes + [num_atoms], activation, None, num_atoms, v_min, v_max)
+        self.register_buffer(
+            "q_support", torch.linspace(v_min, v_max, num_atoms, device=device)
+        )
         # 确保两个Q网络有不同的初始化
         self._initialize_networks()
 
@@ -338,10 +351,16 @@ class MLPActorDistCritic(nn.Module):
         discount: float,
     ) -> torch.Tensor:
         """Projection operation that includes q_support directly"""
-        actions = self.policy_network(state)
+        # Get actions from policy network and apply squashing
+        action_mean, sampled_action, log_action_prob = self.policy_network(state)
+        _, squashed_action, _ = apply_squashing_func(action_mean, sampled_action, log_action_prob)
+        
+        # Extract CNN features from state
+        extracted_features = self.shared_cnn_dense(state)
+        
         q1_proj = self.q_network_1.projection(
-            state,
-            actions,
+            extracted_features,
+            squashed_action,
             rewards,
             bootstrap,
             discount,
@@ -349,8 +368,8 @@ class MLPActorDistCritic(nn.Module):
             self.q_support.device,
         )
         q2_proj = self.q_network_2.projection(
-            state,
-            actions,
+            extracted_features,
+            squashed_action,
             rewards,
             bootstrap,
             discount,
@@ -552,7 +571,10 @@ class FastDCLP:
     """
 
     def __init__(self, state_dim, action_dim, actor_lr=1e-4, critic_lr=1e-4, gamma=0.99, tau=0.005,
-                 alpha=0.2, actor_hidden_sizes=(128, 128, 128, 128), critic_hidden_sizes=(128, 128, 128, 128), num_atoms=251, v_min=-100.0, v_max=100.0, use_grad_norm_clipping=True, max_grad_norm=1.0, device='cuda'):
+                 alpha=0.2, actor_hidden_sizes=[128, 128, 128, 128], critic_hidden_sizes=[128, 128, 128, 128],
+                 num_atoms=251, v_min=-100.0, v_max=100.0, use_grad_norm_clipping=True, max_grad_norm=1.0, device='cuda',
+                 scalar=None, disable_bootstrap=False, amp_enabled=False, amp_device_type='cuda', amp_dtype=torch.float16,
+                 compile_mode="reduce-overhead", policy_frequency=2):
         """
         Initialize FastDCLP algorithm
         Args:
@@ -580,12 +602,20 @@ class FastDCLP:
         self.use_grad_norm_clipping = use_grad_norm_clipping
         self.max_grad_norm = max_grad_norm
         self.device = device
+        self.disable_bootstrap = disable_bootstrap
+        self.amp_device_type = amp_device_type
+        self.amp_dtype = amp_dtype
+        self.amp_enabled = amp_enabled
+        self.compile_mode = compile_mode
+        self.policy_frequency = policy_frequency
+        
+
         
 
         # self.actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
         # self.target_actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
-        self.actor_critic = MLPActorDistCritic(state_dim, action_dim, actor_hidden_sizes, critic_hidden_sizes, num_atoms=num_atoms, v_min=v_min, v_max=v_max).to(device)
-        self.target_actor_critic = MLPActorDistCritic(state_dim, action_dim, actor_hidden_sizes, critic_hidden_sizes, num_atoms=num_atoms, v_min=v_min, v_max=v_max).to(device)
+        self.actor_critic = MLPActorDistCritic(state_dim, action_dim, actor_hidden_sizes, critic_hidden_sizes, num_atoms=num_atoms, v_min=v_min, v_max=v_max, device=device).to(device)
+        self.target_actor_critic = MLPActorDistCritic(state_dim, action_dim, actor_hidden_sizes, critic_hidden_sizes, num_atoms=num_atoms, v_min=v_min, v_max=v_max, device=device).to(device)
         self.update_target_network(tau=self.tau)
         self.actor_optimizer = torch.optim.Adam(self.actor_critic.policy_network.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(
@@ -593,6 +623,31 @@ class FastDCLP:
             list(self.actor_critic.q_network_1.parameters()) +
             list(self.actor_critic.q_network_2.parameters()), lr=critic_lr
         )
+        self.scalar = scalar
+
+    def enable_compile(self, mode=None):
+        """
+        Enable torch.compile for train_step
+        
+        Call this AFTER initialization, BEFORE training starts.
+        """
+        if hasattr(self, '_is_compiled') and self._is_compiled:
+            print("[FastDCLP] Already compiled, skipping...")
+            return
+        
+        # Increase cache size to prevent recompilation
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = 64
+        
+        mode = mode or self.compile_mode
+        print(f"[FastDCLP] Compiling train_step with mode='{mode}'...")
+        print("[FastDCLP] First step will be slow (~30s), then much faster!")
+        
+        # Compile with fullgraph for better optimization
+        self.train_step = torch.compile(self.train_step, mode=mode, fullgraph=False)
+        
+        self._is_compiled = True
+        print("[FastDCLP] ✓ Compilation complete!")
 
     def get_action(self, state, deterministic=True):
         """Get action from current policy"""
@@ -608,67 +663,69 @@ class FastDCLP:
 
                 return sampled_action
 
+    @torch.no_grad()
     def update_target_network(self, tau=None):
         """Soft update of target network parameters"""
-        if tau is None:
-            tau = self.tau
-        for target_param, param in zip(self.target_actor_critic.parameters(),
-                                     self.actor_critic.parameters()):
-            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+        src_ps = [p.data for p in self.actor_critic.parameters()]
+        tgt_ps = [p.data for p in self.target_actor_critic.parameters()]
 
-    def train_step(self, data):
+        torch._foreach_mul_(tgt_ps, 1.0 - tau)
+        torch._foreach_add_(tgt_ps, src_ps, alpha=tau)
+        # if tau is None:
+        #     tau = self.tau
+        # for target_param, param in zip(self.target_actor_critic.parameters(),
+        #                              self.actor_critic.parameters()):
+        #     target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+
+    def train_step(self, data, update_step):
         """
         Single training step
         Args:
             data: Dictionary containing 'state', 'action', 'reward', 'next_state', 'done'
         """
+        with autocast(
+            device_type=self.amp_device_type, dtype=self.amp_dtype, enabled=self.amp_enabled
+        ):
+            critic_states = data["observations"]
+            next_critic_states = data["next"]["observations"]
 
-        states = data["observations"]
-        next_states = data["next"]["observations"]
-        if envs.asymmetric_obs:
-            critic_states = data["critic_observations"]
-            next_critic_states = data["next"]["critic_observations"]
-        else:
-            critic_states = states
-            next_critic_states = next_states
-        actions = data["actions"]
-        rewards = data["next"]["rewards"]
-        dones = data["next"]["dones"].bool()
-        truncations = data["next"]["truncations"].bool()
-        if args.disable_bootstrap:
-            bootstrap = (~dones).float()
-        else:
-            bootstrap = (truncations & ~dones).float()  #Fixed
-        discount = args.gamma ** data["next"]["effective_n_steps"]
+            actions = data["actions"]
+            rewards = data["next"]["rewards"]
+            dones = data["next"]["dones"].bool()
+            truncations = data["next"]["truncations"].bool()
+            if self.disable_bootstrap:
+                bootstrap = (~dones).float()
+            else:
+                bootstrap = (truncations & ~dones).float()
+            discount = self.gamma ** data["next"]["effective_n_steps"]
 
-
-        # =============Dist Critic Update =============
-        with torch.no_grad():
-            qf1_next_target_projected, qf2_next_target_projected = (
-                self.target_actor_critic.projection(
-                    next_critic_states,
-                    rewards,
-                    bootstrap,
-                    discount,
+            # =============Critic Update =============
+            with torch.no_grad():
+                qf1_next_target_projected, qf2_next_target_projected = (
+                    self.target_actor_critic.projection(
+                        next_critic_states,
+                        rewards,
+                        bootstrap,
+                        discount,
+                    )
                 )
-            )
-            qf1_next_target_value = self.target_actor_critic.get_value(qf1_next_target_projected)
-            qf2_next_target_value = self.target_actor_critic.get_value(qf2_next_target_projected)
-            # if args.use_cdq:
-            qf_next_target_dist = torch.where(
-                qf1_next_target_value.unsqueeze(1)
-                < qf2_next_target_value.unsqueeze(1),
-                qf1_next_target_projected,
-                qf2_next_target_projected,
-            )
-            qf1_next_target_dist = qf2_next_target_dist = qf_next_target_dist
-            # else:
-            #     qf1_next_target_dist, qf2_next_target_dist = (
-            #         qf1_next_target_projected,
-            #         qf2_next_target_projected,
-            #     )
+                qf1_next_target_value = self.target_actor_critic.get_value(qf1_next_target_projected)
+                qf2_next_target_value = self.target_actor_critic.get_value(qf2_next_target_projected)
+                
+                qf_next_target_dist = torch.where(
+                    qf1_next_target_value.unsqueeze(1)
+                    < qf2_next_target_value.unsqueeze(1),
+                    qf1_next_target_projected,
+                    qf2_next_target_projected,
+                )
+                qf1_next_target_dist = qf2_next_target_dist = qf_next_target_dist
 
-            qf1, qf2 = self.actor_critic(critic_states, actions)
+            # Manually run critic forward pass (avoid actor execution)
+            extracted_features = self.actor_critic.shared_cnn_dense(critic_states)
+            q_input = torch.cat([extracted_features, actions], dim=-1)
+            qf1 = self.actor_critic.q_network_1(q_input).squeeze(-1)
+            qf2 = self.actor_critic.q_network_2(q_input).squeeze(-1)
+            
             qf1_loss = -torch.sum(
                 qf1_next_target_dist * F.log_softmax(qf1, dim=1), dim=1
             ).mean()
@@ -676,24 +733,12 @@ class FastDCLP:
                 qf2_next_target_dist * F.log_softmax(qf2, dim=1), dim=1
             ).mean()
             critic_loss = qf1_loss + qf2_loss
-        # with torch.no_grad():
-        #     # Target actions from target policy
-        #     _, _, next_log_probs, target_q1, target_q2 = self.target_actor_critic(next_states)
-
-        #     # Take minimum and subtract entropy term
-        #     target_q = torch.min(target_q1, target_q2) - self.alpha * next_log_probs
-        #     target_q = rewards + (~dones) * self.gamma * target_q
-        #     # target_q = rewards + self.gamma * target_q
-        # # Current Q-values
-        # _, _, _, current_q1, current_q2, _, _ = self.actor_critic(states, actions)
-        # # Critic loss
-        # critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
 
         # Update critic
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
+        self.critic_optimizer.zero_grad(set_to_none=True)
+        self.scalar.scale(critic_loss).backward()
+        self.scalar.unscale_(self.critic_optimizer)
 
-        # --- 新增: 计算 Critic Grad Norm ---
         if self.use_grad_norm_clipping:
             critic_grad_norm = torch.nn.utils.clip_grad_norm_(
                 list(self.actor_critic.shared_cnn_dense.parameters()) +
@@ -704,9 +749,10 @@ class FastDCLP:
         else:
             critic_grad_norm = torch.tensor(0.0, device=self.device)
             
-        self.critic_optimizer.step()
+        self.scalar.step(self.critic_optimizer)
+        self.scalar.update()
 
-        # 冻结Q网络参数，只更新策略网络
+        # Freeze Q-networks
         for param in self.actor_critic.q_network_1.parameters():
             param.requires_grad = False
         for param in self.actor_critic.q_network_2.parameters():
@@ -714,26 +760,41 @@ class FastDCLP:
         for param in self.actor_critic.shared_cnn_dense.parameters():
             param.requires_grad = False
 
-# ============= Actor Update =============
-        _, _, log_probs, policy_q1, policy_q2 = self.actor_critic(states)
-        policy_q = torch.min(policy_q1, policy_q2)
-        actor_loss = (self.alpha * log_probs - policy_q).mean()
+        # ============= Actor Update =============
+        if update_step % self.policy_frequency == 1:
+            with autocast(
+                device_type=self.amp_device_type, dtype=self.amp_dtype, enabled=self.amp_enabled
+            ):
+                _, _, log_probs, policy_q1, policy_q2 = self.actor_critic(critic_states)
+                policy_qf1_value = self.actor_critic.get_value(F.softmax(policy_q1, dim=1))
+                policy_qf2_value = self.actor_critic.get_value(F.softmax(policy_q2, dim=1))
+                policy_qf_value = torch.minimum(policy_qf1_value, policy_qf2_value)
+                
+                actor_loss = (self.alpha * log_probs - policy_qf_value).mean()
 
-        # Update actor
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        
-        # --- 新增: 计算 Actor Grad Norm ---
-        if self.use_grad_norm_clipping:
-            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.actor_critic.policy_network.parameters(),
-                max_norm=self.max_grad_norm
-            )
+            # Update actor
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            self.scalar.scale(actor_loss).backward()
+            self.scalar.unscale_(self.actor_optimizer)
+            
+            if self.use_grad_norm_clipping:
+                actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.actor_critic.policy_network.parameters(),
+                    max_norm=self.max_grad_norm
+                )
+            else:
+                actor_grad_norm = torch.tensor(0.0, device=self.device)
+
+            self.scalar.step(self.actor_optimizer)
+            self.scalar.update()
         else:
-            actor_grad_norm = torch.tensor(0.0, device=self.device)
-
-        self.actor_optimizer.step()
+            # Actor not updated this step - use None or dummy values
+            actor_loss = None
+            actor_grad_norm = None
+            policy_qf_value = None
+            log_probs = None
         
+            # Unfreeze Q-networks
         for param in self.actor_critic.q_network_1.parameters():
             param.requires_grad = True
         for param in self.actor_critic.q_network_2.parameters():
@@ -744,19 +805,19 @@ class FastDCLP:
         # Update target network
         self.update_target_network(tau=self.tau)
 
-        return {
-            'actor_loss': actor_loss.item(),
-            'qf_loss': critic_loss.item(), # --- 重命名 ---
-            # --- 新增 ---
-            'actor_grad_norm': actor_grad_norm.item(),
-            'critic_grad_norm': critic_grad_norm.item(),
-            # --- 保留 Q 值用于日志 ---
-            'q1_mean': current_q1.mean().item(),
-            'q2_mean': current_q2.mean().item(),
-            'target_q_mean': target_q.mean().item(),
-            'policy_q_mean': policy_q.mean().item(),
-            'log_probs_mean': log_probs.mean().item(),
-        }
+        # Return simple dict to avoid recompilation - extract scalars outside
+        return (
+            actor_loss,
+            critic_loss,
+            actor_grad_norm,
+            critic_grad_norm,
+            qf1,
+            qf2,
+            qf1_next_target_value,
+            qf_next_target_dist,
+            policy_qf_value,
+            log_probs,
+        )
 
     def save(self, filepath):
         """Save model parameters"""
