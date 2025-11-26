@@ -117,24 +117,38 @@ def create_log_gaussian(mean_tensor, log_std_tensor, sample_points):
 def apply_squashing_func(action_mean, sampled_action, log_action_prob):
     """
     对输入张量应用压缩函数（tanh），并对动作的对数概率进行雅可比修正。
+    
+    实现基于OpenAI SpinningUp官方SAC实现。
+    
     参数：
-        action_mean (torch.Tensor): 需要压缩的均值张量。
-        sampled_action (torch.Tensor): 需要压缩的采样动作张量。
-        log_action_prob (torch.Tensor): 压缩前的动作对数概率。
+        action_mean (torch.Tensor): 未squashed的均值张量。
+        sampled_action (torch.Tensor): 未squashed的采样动作张量。
+        log_action_prob (torch.Tensor): 未squashed动作的对数概率。
     返回：
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            - 压缩后的均值张量（action_mean，tanh 后）。
-            - 压缩后的动作张量（sampled_action，tanh 后）。
-            - 经雅可比修正后的对数概率（log_action_prob）。
+            - 压缩后的均值张量（tanh后）。
+            - 压缩后的动作张量（tanh后）。
+            - 经雅可比修正后的对数概率。
+    
+    注意：
+        Jacobian修正必须在tanh squashing之前计算，使用未squashed的sampled_action。
+        公式来自SAC论文附录C，这是数值稳定的等价形式。
     """
-    # 应用tanh压缩
+    # Step 1: 计算Jacobian修正（使用未squashed的sampled_action）
+    # 公式：log(1 - tanh²(u)) = 2 * (log(2) - u - softplus(-2*u))
+    # 这比直接计算 log(1 - tanh²(u)) 更数值稳定
+    jacobian_correction = torch.sum(
+        2 * (np.log(2) - sampled_action - F.softplus(-2 * sampled_action)),
+        dim=1
+    )
+    
+    # Step 2: 调整log概率（减去Jacobian修正）
+    adjusted_log_prob = log_action_prob - jacobian_correction
+    
+    # Step 3: 应用tanh squashing
     squashed_mean = torch.tanh(action_mean)
     squashed_action = torch.tanh(sampled_action)
-
-    # 雅可比校正：log|det(∂tanh(u)/∂u)| = log(1 - tanh²(u))
-    jacobian_correction = torch.sum(torch.log(clip_with_gradient_passthrough(1 - squashed_action**2, lower_bound=0, upper_bound=1) + 1e-6), dim=1)
-    adjusted_log_prob = log_action_prob - jacobian_correction
-
+    
     return squashed_mean, squashed_action, adjusted_log_prob
 
 
@@ -491,7 +505,7 @@ class DCLPArgs:
     """Compile mode"""
     weight_decay: float = 0.0
     """Weight decay"""
-    use_grad_norm_clipping: bool = True
+    use_grad_norm_clipping: bool = False
     """Use gradient norm clipping"""
     max_grad_norm: float = 0.5
     """Maximum gradient norm"""

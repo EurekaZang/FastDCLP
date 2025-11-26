@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-train_dclp_isaac_lab.py - Training script for DCLP model with IsaacLab environments
+train_fastdclp_isaac_lab.py - Training script for DCLP model with IsaacLab environments
 
 This script trains the DCLP model using FastTD3 algorithm
 with IsaacLab navigation environments. It's optimized for efficient training with LiDAR data.
 
 Usage:
-python fast_td3/train_fastdclp_isaac_lab.py --env_name Isaac-Navigation-Flat-Jackal-v0     --num_envs 16 --buffer_size 5120 --batch_size 32        --actor_hidden_dim 256 --critic_hidden_dim 256     --learning_starts 10000 --total_timesteps 500000   --exp_name "try_training_real_fastdclp" --no-headless --project "FastDCLP-IsaacLab"  """ 
+python ./fast_td3/train_fastdclp_isaac_lab.py --env_name Isaac-Navigation-Flat-Jackal-v0 --num_envs 1024 --buffer_size 5120 --batch_size 32768 --actor_hidden_dim 256 --critic_hidden_dim 256 --learning_starts 10 --actor_learning_rate 0.0003 --critic_learning_rate 0.0003 --actor_learning_rate_end 0.0003 --critic_learning_rate_end 0.0003 --total_timesteps 100000 --exp_name fastdclp_with_entropy_optimedcudagraph_w_step_punish_changeparams_refined_vminmax --num_steps 8 --num_updates 1 --v_min -250 --v_max 250 --compile_mode default --alpha 0.1
+
+""" 
 
 import os
 import sys
@@ -426,6 +428,10 @@ def main():
                         "Training/buffer_rewards": raw_rewards.mean(),
                         "Training/qf_max": logs_dict.get('qf_max'),
                         "Training/qf_min": logs_dict.get('qf_min'),
+                        "Training/q1_max_value": logs_dict.get('q1_max_value'),
+                        "Training/q2_max_value": logs_dict.get('q2_max_value'),
+                        "Training/q1_min_value": logs_dict.get('q1_min_value'),
+                        "Training/q2_min_value": logs_dict.get('q2_min_value'),
                         "Training/policy_q_mean": logs_dict.get('policy_q_mean'),
                         "Training/log_probs_mean": logs_dict.get('log_probs_mean'),
                         
@@ -434,18 +440,22 @@ def main():
                         "Training/env0_angular_action": actions[0][1] * 10,
                     }
 
-                    if args.eval_interval > 0 and global_step % args.eval_interval == 0:
-                        print(f"Evaluating at global step {global_step}")
-                        eval_avg_return, eval_avg_length, eval_success_rate = evaluate()
-
-                        wandb_logs["Evaluation/eval_avg_return"] = eval_avg_return
-                        wandb_logs["Evaluation/eval_avg_length"] = eval_avg_length
-                        wandb_logs["Evaluation/eval_avg_success_rate"] = eval_success_rate
-                
                 # 过滤掉 None 值
                 wandb_logs = {k: v for k, v in wandb_logs.items() if v is not None}
                 if args.use_wandb:
                     wandb.log(wandb_logs, step=global_step)
+
+            # --- Evaluation Logging ---
+            if args.eval_interval > 0 and global_step % args.eval_interval == 0:
+                print(f"Evaluating at global step {global_step}")
+                eval_avg_return, eval_avg_length, eval_success_rate = evaluate()
+                
+                if args.use_wandb:
+                    wandb.log({
+                        "Evaluation/eval_avg_return": eval_avg_return,
+                        "Evaluation/eval_avg_length": eval_avg_length,
+                        "Evaluation/eval_success_rate": eval_success_rate
+                    }, step=global_step)
 
             if window_eps_acc > window_eps_log:
                 if args.use_wandb:

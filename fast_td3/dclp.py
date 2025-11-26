@@ -626,10 +626,6 @@ class FastDCLP:
             list(self.actor_critic.q_network_1.parameters()) +
             list(self.actor_critic.q_network_2.parameters()), lr=critic_lr
         )
-        # self.target_entropy = -float(action_dim)  # -n_act TODO: think about it
-        # log_alpha = torch.ones(1, requires_grad=True, device=device)
-        # log_alpha.data.copy_(torch.tensor([np.log(0.2)], device=device))  # Start with higher alpha for exploration
-        # alpha_optimizer = optim.Adam([log_alpha], lr=args.alpha_learning_rate)
         self.scalar = scalar
 
     def enable_compile(self, mode=None):
