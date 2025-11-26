@@ -505,9 +505,9 @@ class DCLPArgs:
     """Experiment name"""
     log_interval: int = 100
     """Logging interval"""
-    eval_interval: int = 100000
+    eval_interval: int = 10000
     """Evaluation interval"""
-    save_interval: int = 100000
+    save_interval: int = 10000
     """Model save interval"""
 
     # Environment specific

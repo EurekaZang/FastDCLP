@@ -384,7 +384,7 @@ def main():
                 # Train DCLP 并获取指标
                 result = dclp.train_step(data, do_actor_update)
                 # Unpack tuple and extract scalars immediately
-                actor_loss, critic_loss, actor_grad_norm, critic_grad_norm, qf1, qf2, qf1_next_target_value, qf_next_target_dist, policy_qf_value, log_probs = result
+                actor_loss, critic_loss, actor_grad_norm, critic_grad_norm, qf1, qf2, min_qf_next_target_value, qf_next_target_dist, policy_qf_value, log_probs = result
                 
                 # Create logs dict with extracted values
                 # Note: actor values will be zero when actor is not updated
@@ -393,8 +393,8 @@ def main():
                     'qf_loss': critic_loss.detach(),
                     'actor_grad_norm': actor_grad_norm.detach(),
                     'critic_grad_norm': critic_grad_norm.detach(),
-                    'qf_max': qf1_next_target_value.max().detach(),
-                    'qf_min': qf1_next_target_value.min().detach(),
+                    'qf_max': min_qf_next_target_value.max().detach(),
+                    'qf_min': min_qf_next_target_value.min().detach(),
                     'q1_max_value': qf1.argmax(dim=1).detach(),
                     'q2_max_value': qf2.argmax(dim=1).detach(),
                     'q1_min_value': qf1.argmin(dim=1).detach(),

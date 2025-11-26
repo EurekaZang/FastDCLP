@@ -239,7 +239,6 @@ class MLPActorCritic(nn.Module):
         else:
             return squashed_mean, squashed_action, adjusted_log_prob, q1_policy_value, q2_policy_value
 
-#TODO: Implement DSAC
 class MLPActorDistCritic(nn.Module):
     """
     Actor-Critic network with distributional critic.
@@ -255,6 +254,7 @@ class MLPActorDistCritic(nn.Module):
             num_atoms=251,
             v_min=-100.0,
             v_max=100.0,
+            alpha=0.2,
             device="cuda",
             ):
         super(MLPActorDistCritic, self).__init__()
@@ -286,13 +286,14 @@ class MLPActorDistCritic(nn.Module):
             "q_support", torch.linspace(v_min, v_max, num_atoms, device=device)
         )
         # 确保两个Q网络有不同的初始化
-        self._initialize_networks()
+        self.alpha = alpha
+        # self._initialize_networks()
 
     def _initialize_networks(self):
         for layer in self.q_network_1.layer_modules:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight)
-                nn.init.constant_(layer.bias, 0.0)
+                nn.init.constant_(layer.bias, 0.1)
         for layer in self.q_network_2.layer_modules:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight)
@@ -353,7 +354,7 @@ class MLPActorDistCritic(nn.Module):
         """Projection operation that includes q_support directly"""
         # Get actions from policy network and apply squashing
         action_mean, sampled_action, log_action_prob = self.policy_network(state)
-        _, squashed_action, _ = apply_squashing_func(action_mean, sampled_action, log_action_prob)
+        _, squashed_action, adjusted_log_prob = apply_squashing_func(action_mean, sampled_action, log_action_prob)
         
         # Extract CNN features from state
         extracted_features = self.shared_cnn_dense(state)
@@ -362,6 +363,7 @@ class MLPActorDistCritic(nn.Module):
             extracted_features,
             squashed_action,
             rewards,
+            # rewards - self.alpha * adjusted_log_prob,
             bootstrap,
             discount,
             self.q_support,
@@ -371,6 +373,7 @@ class MLPActorDistCritic(nn.Module):
             extracted_features,
             squashed_action,
             rewards,
+            # rewards - self.alpha * adjusted_log_prob,
             bootstrap,
             discount,
             self.q_support,
@@ -614,8 +617,8 @@ class FastDCLP:
 
         # self.actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
         # self.target_actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
-        self.actor_critic = MLPActorDistCritic(state_dim, action_dim, actor_hidden_sizes, critic_hidden_sizes, num_atoms=num_atoms, v_min=v_min, v_max=v_max, device=device).to(device)
-        self.target_actor_critic = MLPActorDistCritic(state_dim, action_dim, actor_hidden_sizes, critic_hidden_sizes, num_atoms=num_atoms, v_min=v_min, v_max=v_max, device=device).to(device)
+        self.actor_critic = MLPActorDistCritic(state_dim, action_dim, actor_hidden_sizes, critic_hidden_sizes, num_atoms=num_atoms, v_min=v_min, v_max=v_max, alpha=alpha, device=device).to(device)
+        self.target_actor_critic = MLPActorDistCritic(state_dim, action_dim, actor_hidden_sizes, critic_hidden_sizes, num_atoms=num_atoms, v_min=v_min, v_max=v_max, alpha=alpha, device=device).to(device)
         self.update_target_network(tau=self.tau)
         self.actor_optimizer = torch.optim.Adam(self.actor_critic.policy_network.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(
@@ -816,7 +819,7 @@ class FastDCLP:
             critic_grad_norm,
             qf1,
             qf2,
-            qf1_next_target_value,
+            torch.minimum(qf1_next_target_value, qf2_next_target_value),
             qf_next_target_dist,
             policy_qf_value,
             log_probs,
