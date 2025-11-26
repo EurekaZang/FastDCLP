@@ -427,13 +427,13 @@ class DCLPArgs:
     """Entropy regularization coefficient"""
 
     # Learning rates
-    actor_learning_rate: float = 2e-4
+    actor_learning_rate: float = 1e-4
     """Actor learning rate"""
-    critic_learning_rate: float = 2e-4
+    critic_learning_rate: float = 1e-4
     """Critic learning rate"""
-    actor_learning_rate_end: float = 2e-4
+    actor_learning_rate_end: float = 1e-4
     """Actor final learning rate"""
-    critic_learning_rate_end: float = 2e-4
+    critic_learning_rate_end: float = 1e-4
     """Critic final learning rate"""
 
     # Network architecture

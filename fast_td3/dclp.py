@@ -677,11 +677,12 @@ class FastDCLP:
         #                              self.actor_critic.parameters()):
         #     target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
-    def train_step(self, data, update_step):
+    def train_step(self, data, do_actor_update: bool):
         """
         Single training step
         Args:
             data: Dictionary containing 'state', 'action', 'reward', 'next_state', 'done'
+            do_actor_update: Boolean flag indicating whether to update the actor this step
         """
         with autocast(
             device_type=self.amp_device_type, dtype=self.amp_dtype, enabled=self.amp_enabled
@@ -753,15 +754,15 @@ class FastDCLP:
         self.scalar.update()
 
         # Freeze Q-networks
-        for param in self.actor_critic.q_network_1.parameters():
-            param.requires_grad = False
-        for param in self.actor_critic.q_network_2.parameters():
-            param.requires_grad = False
-        for param in self.actor_critic.shared_cnn_dense.parameters():
-            param.requires_grad = False
+        # for param in self.actor_critic.q_network_1.parameters():
+        #     param.requires_grad = False
+        # for param in self.actor_critic.q_network_2.parameters():
+        #     param.requires_grad = False
+        # for param in self.actor_critic.shared_cnn_dense.parameters():
+        #     param.requires_grad = False
 
         # ============= Actor Update =============
-        if update_step % self.policy_frequency == 1:
+        if do_actor_update:
             with autocast(
                 device_type=self.amp_device_type, dtype=self.amp_dtype, enabled=self.amp_enabled
             ):
@@ -783,24 +784,26 @@ class FastDCLP:
                     max_norm=self.max_grad_norm
                 )
             else:
-                actor_grad_norm = torch.tensor(0.0, device=self.device)
+                actor_grad_norm = torch.zeros((), device=self.device)
 
             self.scalar.step(self.actor_optimizer)
             self.scalar.update()
         else:
-            # Actor not updated this step - use None or dummy values
-            actor_loss = None
-            actor_grad_norm = None
-            policy_qf_value = None
-            log_probs = None
+            # Actor not updated this step - use zero tensors to avoid graph breaks
+            # Using None would cause torch.compile to recompile
+            actor_loss = torch.zeros((), device=self.device)
+            actor_grad_norm = torch.zeros((), device=self.device)
+            policy_qf_value = torch.zeros(critic_states.shape[0], device=self.device)
+            log_probs = torch.zeros(critic_states.shape[0], device=self.device)
         
-            # Unfreeze Q-networks
-        for param in self.actor_critic.q_network_1.parameters():
-            param.requires_grad = True
-        for param in self.actor_critic.q_network_2.parameters():
-            param.requires_grad = True
-        for param in self.actor_critic.shared_cnn_dense.parameters():
-            param.requires_grad = True
+        # Always unfreeze Q-networks after actor update (or skip)
+        # This is critical: Q-networks must be unfrozen for the next critic update
+        # for param in self.actor_critic.q_network_1.parameters():
+        #     param.requires_grad = True
+        # for param in self.actor_critic.q_network_2.parameters():
+        #     param.requires_grad = True
+        # for param in self.actor_critic.shared_cnn_dense.parameters():
+        #     param.requires_grad = True
 
         # Update target network
         self.update_target_network(tau=self.tau)

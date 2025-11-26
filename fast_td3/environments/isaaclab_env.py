@@ -70,7 +70,7 @@ class IsaacLabEnv:
         dones = (terminations | truncations).to(dtype=torch.long)
         obs = obs_dict["policy"]
         critic_obs = obs_dict["critic"] if self.asymmetric_obs else None
-        info_ret = {"time_outs": truncations, "observations": {"critic": critic_obs}, "successes":infos.get("successes") & terminations}
+        info_ret = {"time_outs": truncations, "observations": {"critic": critic_obs}, "successes":infos.get("successes")} #& terminations}
         # NOTE: There's really no way to get the raw observations from IsaacLab
         # We just use the 'reset_obs' as next_obs, unfortunately.
         # See https://github.com/isaac-sim/IsaacLab/issues/1362

@@ -189,30 +189,35 @@ def main():
         device=device,     #torch.device("cpu"),
     )
     print("Replay buffer initialized successfully")
-    #FIXME: Any problem?
     def evaluate():
-        """Evaluation function"""
+        """
+        Evaluation function for IsaacLab environments.
+        
+        Note: IsaacLab automatically resets sub-environments when they terminate.
+        We track only the FIRST episode completion for each environment.
+        """
         print("Running evaluation...")
         num_eval_envs = envs.num_envs
+        
+        # Track cumulative stats for current episode
         episode_returns = torch.zeros(num_eval_envs, device=device)
         episode_lengths = torch.zeros(num_eval_envs, device=device)
         done_masks = torch.zeros(num_eval_envs, dtype=torch.bool, device=device)
-
-
+        episode_successes = torch.zeros(num_eval_envs, dtype=torch.bool, device=device)
 
         obs = envs.reset(random_start_init=False)
 
-        print(f"\nStarting evaluation episode {evaluate_episode+1}")
         max_eval_steps = envs.max_episode_steps
-        step_pbar = tqdm.tqdm(range(max_eval_steps),
-                            desc=f"Episode {evaluate_episode+1}/{num_eval_episodes}",
-                            leave=False)
-        for step in step_pbar:
+        for step in range(max_eval_steps):
             with torch.no_grad(), autocast(
                 device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
             ):              
-                norm_obs = obs_normalizer(obs, update=False)
+                if args.obs_normalization:
+                    norm_obs = obs_normalizer(obs, update=False)
+                else:
+                    norm_obs = obs
                 actions = dclp.get_action(norm_obs)
+            
             next_obs, rewards, dones, infos = envs.step(actions.float())
             episode_returns = torch.where(
                 ~done_masks, episode_returns + rewards, episode_returns
@@ -220,14 +225,15 @@ def main():
             episode_lengths = torch.where(
                 ~done_masks, episode_lengths + 1, episode_lengths
             )
-            if env_type == "mtbench" and "episode" in infos:
-                dones = dones | infos["episode"]["success"]
+            episode_successes = torch.where(
+                ~done_masks, episode_successes | infos["successes"], episode_successes
+            )
             done_masks = torch.logical_or(done_masks, dones)
             if done_masks.all():
                 break
             obs = next_obs
-
-        return episode_returns.mean().item(), episode_lengths.mean().item()
+        episode_successes_rate = episode_successes.float().mean().item()
+        return episode_returns.mean().item(), episode_lengths.mean().item(), episode_successes_rate
 
     # Log hyperparameters to W&B
     if args.use_wandb:
@@ -274,6 +280,7 @@ def main():
     window_eps_log = args.log_interval
     window_eps_acc = 0
     window_succ_acc = 0
+    ema_success_rate = 0.0  # Initialize EMA success rate
 
     obs = envs.reset(random_start_init=False)
     dones = torch.zeros(args.num_envs, dtype=torch.bool, device=device)
@@ -305,7 +312,8 @@ def main():
         window_eps_acc += eps
         window_succ_acc += succ
         batch_rate = succ / max(1, eps) if eps > 0 else None
-        ema_success_rate = ema_success_rate * 0.95 + 0.05 * batch_rate if "ema" in locals() else batch_rate
+        if batch_rate is not None:
+            ema_success_rate = ema_success_rate * 0.95 + 0.05 * batch_rate
         
         if args.reward_normalization:
             update_stats(rewards, dones.float())     
@@ -367,16 +375,23 @@ def main():
                 raw_rewards = data["next"]["rewards"]
                 data["next"]["rewards"] = normalize_reward(raw_rewards)
 
+                # Calculate whether to update actor this step
+                if args.num_updates > 1:
+                    do_actor_update = (i % args.policy_frequency == 1) 
+                else:
+                    do_actor_update = (global_step % args.policy_frequency == 0)
+                
                 # Train DCLP 并获取指标
-                result = dclp.train_step(data, i)
+                result = dclp.train_step(data, do_actor_update)
                 # Unpack tuple and extract scalars immediately
                 actor_loss, critic_loss, actor_grad_norm, critic_grad_norm, qf1, qf2, qf1_next_target_value, qf_next_target_dist, policy_qf_value, log_probs = result
                 
                 # Create logs dict with extracted values
+                # Note: actor values will be zero when actor is not updated
                 logs_dict = {
-                    'actor_loss': actor_loss.detach() if actor_loss is not None else None,
+                    'actor_loss': actor_loss.detach(),
                     'qf_loss': critic_loss.detach(),
-                    'actor_grad_norm': actor_grad_norm.detach() if actor_grad_norm is not None else None,
+                    'actor_grad_norm': actor_grad_norm.detach(),
                     'critic_grad_norm': critic_grad_norm.detach(),
                     'qf_max': qf1_next_target_value.max().detach(),
                     'qf_min': qf1_next_target_value.min().detach(),
@@ -384,8 +399,8 @@ def main():
                     'q2_max_value': qf2.argmax(dim=1).detach(),
                     'q1_min_value': qf1.argmin(dim=1).detach(),
                     'q2_min_value': qf2.argmin(dim=1).detach(),
-                    'policy_q_mean': policy_qf_value.mean().detach() if policy_qf_value is not None else None,
-                    'log_probs_mean': log_probs.mean().detach() if log_probs is not None else None,
+                    'policy_q_mean': policy_qf_value.mean().detach(),
+                    'log_probs_mean': log_probs.mean().detach(),
                 }
             
             # Update learning rate schedulers after optimizer steps
@@ -413,10 +428,9 @@ def main():
                         "actor_grad_norm": logs_dict.get('actor_grad_norm'),
                         "critic_grad_norm": logs_dict.get('critic_grad_norm'),
                         "buffer_rewards": raw_rewards.mean(),
-                        "qf_max": logs_dict.get('q1_mean'), # 使用 q1_mean 作为 qf_max 的代理
-                        "qf_min": logs_dict.get('q2_mean'), # 使用 q2_mean 作为 qf_min 的代理
+                        "qf_max": logs_dict.get('qf_max'), # 使用 q1_mean 作为 qf_max 的代理
+                        "qf_min": logs_dict.get('qf_min'), # 使用 q2_mean 作为 qf_min 的代理
                         "policy_q_mean": logs_dict.get('policy_q_mean'),
-                        "target_q_mean": logs_dict.get('target_q_mean'),
                         "log_probs_mean": logs_dict.get('log_probs_mean'),
                         
                         # --- 动作日志 ---
@@ -426,12 +440,13 @@ def main():
 
                     if args.eval_interval > 0 and global_step % args.eval_interval == 0:
                         print(f"Evaluating at global step {global_step}")
-                        eval_avg_return, eval_avg_length = evaluate()
+                        eval_avg_return, eval_avg_length, eval_success_rate = evaluate()
                         if env_type in ["humanoid_bench", "isaaclab", "mtbench"]:
                             # NOTE: Hacky way of evaluating performance, but just works
                             obs = envs.reset()
                         wandb_logs["eval_avg_return"] = eval_avg_return
                         wandb_logs["eval_avg_length"] = eval_avg_length
+                        wandb_logs["eval_avg_success_rate"] = eval_success_rate
                 
                 # 过滤掉 None 值
                 wandb_logs = {k: v for k, v in wandb_logs.items() if v is not None}
@@ -473,14 +488,16 @@ def main():
 
     # Final evaluation and save
     print("🏁 Training completed!")
-    eval_avg_return, eval_avg_length = evaluate()
+    eval_avg_return, eval_avg_length, eval_success_rate = evaluate()
     os.makedirs("models", exist_ok=True)
     final_save_path = f"models/{run_name}_final.pt"
     dclp.save(final_save_path)
     print(f"✅ Final evaluation return: {eval_avg_return:.2f}")
     print(f"✅ Final evaluation length: {eval_avg_length:.2f}")
+    print(f"✅ Final evaluation success rate: {eval_success_rate:.2f}")
     print(f"💾 Model saved to: {final_save_path}")
     if args.use_wandb:
+        wandb.log({"eval_avg_return": eval_avg_return, "eval_avg_length": eval_avg_length, "eval_success_rate": eval_success_rate}, step=global_step+1)
         wandb.finish()
 
 
