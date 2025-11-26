@@ -196,7 +196,6 @@ def main():
         Note: IsaacLab automatically resets sub-environments when they terminate.
         We track only the FIRST episode completion for each environment.
         """
-        print("Running evaluation...")
         num_eval_envs = envs.num_envs
         
         # Track cumulative stats for current episode

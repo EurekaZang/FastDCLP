@@ -286,7 +286,6 @@ class MLPActorDistCritic(nn.Module):
             "q_support", torch.linspace(v_min, v_max, num_atoms, device=device)
         )
         # 确保两个Q网络有不同的初始化
-        self.alpha = alpha
         # self._initialize_networks()
 
     def _initialize_networks(self):
@@ -350,6 +349,7 @@ class MLPActorDistCritic(nn.Module):
         rewards: torch.Tensor,
         bootstrap: torch.Tensor,
         discount: float,
+        alpha: float = 0.2,
     ) -> torch.Tensor:
         """Projection operation that includes q_support directly"""
         # Get actions from policy network and apply squashing
@@ -363,7 +363,7 @@ class MLPActorDistCritic(nn.Module):
             extracted_features,
             squashed_action,
             rewards,
-            # rewards - self.alpha * adjusted_log_prob,
+            # rewards - alpha * adjusted_log_prob,
             bootstrap,
             discount,
             self.q_support,
@@ -373,7 +373,7 @@ class MLPActorDistCritic(nn.Module):
             extracted_features,
             squashed_action,
             rewards,
-            # rewards - self.alpha * adjusted_log_prob,
+            # rewards - alpha * adjusted_log_prob,
             bootstrap,
             discount,
             self.q_support,
@@ -617,8 +617,8 @@ class FastDCLP:
 
         # self.actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
         # self.target_actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
-        self.actor_critic = MLPActorDistCritic(state_dim, action_dim, actor_hidden_sizes, critic_hidden_sizes, num_atoms=num_atoms, v_min=v_min, v_max=v_max, alpha=alpha, device=device).to(device)
-        self.target_actor_critic = MLPActorDistCritic(state_dim, action_dim, actor_hidden_sizes, critic_hidden_sizes, num_atoms=num_atoms, v_min=v_min, v_max=v_max, alpha=alpha, device=device).to(device)
+        self.actor_critic = MLPActorDistCritic(state_dim, action_dim, actor_hidden_sizes, critic_hidden_sizes, num_atoms=num_atoms, v_min=v_min, v_max=v_max, device=device).to(device)
+        self.target_actor_critic = MLPActorDistCritic(state_dim, action_dim, actor_hidden_sizes, critic_hidden_sizes, num_atoms=num_atoms, v_min=v_min, v_max=v_max, device=device).to(device)
         self.update_target_network(tau=1.0)
         self.actor_optimizer = torch.optim.Adam(self.actor_critic.policy_network.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(
@@ -626,6 +626,10 @@ class FastDCLP:
             list(self.actor_critic.q_network_1.parameters()) +
             list(self.actor_critic.q_network_2.parameters()), lr=critic_lr
         )
+        # self.target_entropy = -float(action_dim)  # -n_act TODO: think about it
+        # log_alpha = torch.ones(1, requires_grad=True, device=device)
+        # log_alpha.data.copy_(torch.tensor([np.log(0.2)], device=device))  # Start with higher alpha for exploration
+        # alpha_optimizer = optim.Adam([log_alpha], lr=args.alpha_learning_rate)
         self.scalar = scalar
 
     def enable_compile(self, mode=None):
@@ -713,6 +717,7 @@ class FastDCLP:
                         rewards,
                         bootstrap,
                         discount,
+                        self.alpha,
                     )
                 )
                 qf1_next_target_value = self.target_actor_critic.get_value(qf1_next_target_projected)
