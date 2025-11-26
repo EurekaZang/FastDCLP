@@ -412,38 +412,35 @@ def main():
                 speed = global_step / elapsed_time if elapsed_time > 0 else 0
                 with torch.no_grad():
                     wandb_logs = {
-                        "speed": speed,
-                        "frame": global_step * args.num_envs,
-                        "global_success_rate": total_success / max(1, total_eps),
-                        "ema_success_rate": ema_success_rate,
-                        "critic_lr": q_scheduler.get_last_lr()[0],
-                        "actor_lr": actor_scheduler.get_last_lr()[0],
-                        "env_rewards": rewards.mean(), # 'rewards' 是来自 env.step 的最新奖励
-                        
-                        # --- 添加来自 DCLP 的指标 ---
-                        # (使用 .get() 避免在 logs_dict 为空时出错)
-                        "actor_loss": logs_dict.get('actor_loss'),
-                        "qf_loss": logs_dict.get('qf_loss'),
-                        "actor_grad_norm": logs_dict.get('actor_grad_norm'),
-                        "critic_grad_norm": logs_dict.get('critic_grad_norm'),
-                        "buffer_rewards": raw_rewards.mean(),
-                        "qf_max": logs_dict.get('qf_max'), # 使用 q1_mean 作为 qf_max 的代理
-                        "qf_min": logs_dict.get('qf_min'), # 使用 q2_mean 作为 qf_min 的代理
-                        "policy_q_mean": logs_dict.get('policy_q_mean'),
-                        "log_probs_mean": logs_dict.get('log_probs_mean'),
+                        "Training/speed": speed,
+                        "Training/frame": global_step * args.num_envs,
+                        "Training/global_success_rate": total_success / max(1, total_eps),
+                        "Training/ema_success_rate": ema_success_rate,
+                        "Training/critic_lr": q_scheduler.get_last_lr()[0],
+                        "Training/actor_lr": actor_scheduler.get_last_lr()[0],
+                        "Training/env_rewards": rewards.mean(),
+                        "Training/actor_loss": logs_dict.get('actor_loss'),
+                        "Training/qf_loss": logs_dict.get('qf_loss'),
+                        "Training/actor_grad_norm": logs_dict.get('actor_grad_norm'),
+                        "Training/critic_grad_norm": logs_dict.get('critic_grad_norm'),
+                        "Training/buffer_rewards": raw_rewards.mean(),
+                        "Training/qf_max": logs_dict.get('qf_max'),
+                        "Training/qf_min": logs_dict.get('qf_min'),
+                        "Training/policy_q_mean": logs_dict.get('policy_q_mean'),
+                        "Training/log_probs_mean": logs_dict.get('log_probs_mean'),
                         
                         # --- 动作日志 ---
-                        "env0_linear_action": actions[0][0] * 10,
-                        "env0_angular_action": actions[0][1] * 10,
+                        "Training/env0_linear_action": actions[0][0] * 10,
+                        "Training/env0_angular_action": actions[0][1] * 10,
                     }
 
                     if args.eval_interval > 0 and global_step % args.eval_interval == 0:
                         print(f"Evaluating at global step {global_step}")
                         eval_avg_return, eval_avg_length, eval_success_rate = evaluate()
 
-                        wandb_logs["eval_avg_return"] = eval_avg_return
-                        wandb_logs["eval_avg_length"] = eval_avg_length
-                        wandb_logs["eval_avg_success_rate"] = eval_success_rate
+                        wandb_logs["Evaluation/eval_avg_return"] = eval_avg_return
+                        wandb_logs["Evaluation/eval_avg_length"] = eval_avg_length
+                        wandb_logs["Evaluation/eval_avg_success_rate"] = eval_success_rate
                 
                 # 过滤掉 None 值
                 wandb_logs = {k: v for k, v in wandb_logs.items() if v is not None}
@@ -452,7 +449,7 @@ def main():
 
             if window_eps_acc > window_eps_log:
                 if args.use_wandb:
-                    wandb.log({"window_success_rate": window_succ_acc / max(1, window_eps_acc)}, step=global_step)
+                    wandb.log({"Training/window_success_rate": window_succ_acc / max(1, window_eps_acc)}, step=global_step)
                 else:
                     print("window_success_rate", window_succ_acc / max(1, window_eps_acc))
                 window_eps_acc = 0
@@ -494,7 +491,7 @@ def main():
     print(f"✅ Final evaluation success rate: {eval_success_rate:.2f}")
     print(f"💾 Model saved to: {final_save_path}")
     if args.use_wandb:
-        wandb.log({"eval_avg_return": eval_avg_return, "eval_avg_length": eval_avg_length, "eval_success_rate": eval_success_rate}, step=global_step+1)
+        wandb.log({"Evaluation/eval_avg_return": eval_avg_return, "Evaluation/eval_avg_length": eval_avg_length, "Evaluation/eval_success_rate": eval_success_rate}, step=global_step+1)
         wandb.finish()
 
 
