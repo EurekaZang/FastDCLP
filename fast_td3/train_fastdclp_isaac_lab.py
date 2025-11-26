@@ -441,9 +441,7 @@ def main():
                     if args.eval_interval > 0 and global_step % args.eval_interval == 0:
                         print(f"Evaluating at global step {global_step}")
                         eval_avg_return, eval_avg_length, eval_success_rate = evaluate()
-                        if env_type in ["humanoid_bench", "isaaclab", "mtbench"]:
-                            # NOTE: Hacky way of evaluating performance, but just works
-                            obs = envs.reset()
+
                         wandb_logs["eval_avg_return"] = eval_avg_return
                         wandb_logs["eval_avg_length"] = eval_avg_length
                         wandb_logs["eval_avg_success_rate"] = eval_success_rate

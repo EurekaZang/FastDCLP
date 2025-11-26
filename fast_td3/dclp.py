@@ -75,7 +75,7 @@ class MLPGaussianPolicy(nn.Module):
             reshaped_lidar[:, :, 3:6]
         ], dim=-1)
         # 提取其他状态信息, not used in this context
-        additional_state_info = state_input[:, 6*90:6*90+8]
+        additional_state_info = state_input[:, 6*90:]
         additional_state_info = additional_state_info.view(-1, 8)
         # CNN特征提取
         cnn_features = self.cnn_feature_extractor(combined_lidar_features, additional_state_info)
@@ -334,12 +334,12 @@ class MLPActorDistCritic(nn.Module):
         # 共享CNN特征提取
         extracted_features = self.shared_cnn_dense(state_input)  # 提取136维特征
         # 计算当前策略下的Q值
-        q1_policy_value = self.q_network_1(torch.cat([extracted_features, squashed_action], dim=-1)).squeeze(-1)    # Q1(s,π(s))
-        q2_policy_value = self.q_network_2(torch.cat([extracted_features, squashed_action], dim=-1)).squeeze(-1)    # Q2(s,π(s))
+        q1_policy_value = self.q_network_1(torch.cat([extracted_features, squashed_action], dim=-1))   # Q1(s,π(s))
+        q2_policy_value = self.q_network_2(torch.cat([extracted_features, squashed_action], dim=-1))    # Q2(s,π(s))
         if action_input is not None:
             # 如果提供了动作，计算Q(s,a)
-            q1_value = self.q_network_1(torch.cat([extracted_features, action_input], dim=-1)).squeeze(-1)        # Q1(s,a)
-            q2_value = self.q_network_2(torch.cat([extracted_features, action_input], dim=-1)).squeeze(-1)        # Q2(s,a)
+            q1_value = self.q_network_1(torch.cat([extracted_features, action_input], dim=-1))        # Q1(s,a)
+            q2_value = self.q_network_2(torch.cat([extracted_features, action_input], dim=-1))        # Q2(s,a)
             return squashed_mean, squashed_action, adjusted_log_prob, q1_value, q2_value, q1_policy_value, q2_policy_value
         else:
             return squashed_mean, squashed_action, adjusted_log_prob, q1_policy_value, q2_policy_value
@@ -422,7 +422,7 @@ class DCLP:
         
         self.actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
         self.target_actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
-        self.update_target_network(tau=self.tau)
+        self.update_target_network(tau=1.0)
         self.actor_optimizer = torch.optim.Adam(self.actor_critic.policy_network.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(
             list(self.actor_critic.shared_cnn_dense.parameters()) +
@@ -619,7 +619,7 @@ class FastDCLP:
         # self.target_actor_critic = MLPActorCritic(state_dim, action_dim, hidden_sizes).to(device)
         self.actor_critic = MLPActorDistCritic(state_dim, action_dim, actor_hidden_sizes, critic_hidden_sizes, num_atoms=num_atoms, v_min=v_min, v_max=v_max, alpha=alpha, device=device).to(device)
         self.target_actor_critic = MLPActorDistCritic(state_dim, action_dim, actor_hidden_sizes, critic_hidden_sizes, num_atoms=num_atoms, v_min=v_min, v_max=v_max, alpha=alpha, device=device).to(device)
-        self.update_target_network(tau=self.tau)
+        self.update_target_network(tau=1.0)
         self.actor_optimizer = torch.optim.Adam(self.actor_critic.policy_network.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(
             list(self.actor_critic.shared_cnn_dense.parameters()) +
@@ -648,7 +648,7 @@ class FastDCLP:
         
         # Compile with fullgraph for better optimization
         self.train_step = torch.compile(self.train_step, mode=mode, fullgraph=False)
-        
+        self.update_target_network = torch.compile(self.update_target_network, mode=mode, fullgraph=False)
         self._is_compiled = True
         print("[FastDCLP] ✓ Compilation complete!")
 
@@ -669,6 +669,8 @@ class FastDCLP:
     @torch.no_grad()
     def update_target_network(self, tau=None):
         """Soft update of target network parameters"""
+        if tau is None:
+            tau = self.tau
         src_ps = [p.data for p in self.actor_critic.parameters()]
         tgt_ps = [p.data for p in self.target_actor_critic.parameters()]
 
@@ -700,7 +702,7 @@ class FastDCLP:
             if self.disable_bootstrap:
                 bootstrap = (~dones).float()
             else:
-                bootstrap = (truncations & ~dones).float()
+                bootstrap = (truncations | ~dones).float()   #Fixed
             discount = self.gamma ** data["next"]["effective_n_steps"]
 
             # =============Critic Update =============
@@ -727,15 +729,31 @@ class FastDCLP:
             # Manually run critic forward pass (avoid actor execution)
             extracted_features = self.actor_critic.shared_cnn_dense(critic_states)
             q_input = torch.cat([extracted_features, actions], dim=-1)
-            qf1 = self.actor_critic.q_network_1(q_input).squeeze(-1)
-            qf2 = self.actor_critic.q_network_2(q_input).squeeze(-1)
+            qf1_logits = self.actor_critic.q_network_1(q_input)
+            qf2_logits = self.actor_critic.q_network_2(q_input)
             
-            qf1_loss = -torch.sum(
-                qf1_next_target_dist * F.log_softmax(qf1, dim=1), dim=1
-            ).mean()
-            qf2_loss = -torch.sum(
-                qf2_next_target_dist * F.log_softmax(qf2, dim=1), dim=1
-            ).mean()
+            
+            # qf1_loss = -torch.sum(
+            #     qf1_next_target_dist * F.log_softmax(qf1, dim=1), dim=1
+            # ).mean()
+
+            # qf2_loss = -torch.sum(
+            #     qf2_next_target_dist * F.log_softmax(qf2, dim=1), dim=1
+            # ).mean()
+
+            # Use PyTorch's kl_div for better numerical stability
+            # kl_div expects log-probabilities as input and probabilities as target
+            # reduction='batchmean' averages over batch dimension
+            qf1_loss = F.kl_div(
+                F.log_softmax(qf1_logits, dim=1),
+                qf1_next_target_dist,
+                reduction='batchmean'
+            )
+            qf2_loss = F.kl_div(
+                F.log_softmax(qf2_logits, dim=1),
+                qf2_next_target_dist,
+                reduction='batchmean'
+            )
             critic_loss = qf1_loss + qf2_loss
 
         # Update critic
@@ -817,8 +835,8 @@ class FastDCLP:
             critic_loss,
             actor_grad_norm,
             critic_grad_norm,
-            qf1,
-            qf2,
+            qf1_logits,
+            qf2_logits,
             torch.minimum(qf1_next_target_value, qf2_next_target_value),
             qf_next_target_dist,
             policy_qf_value,
