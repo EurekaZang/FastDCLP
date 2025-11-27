@@ -73,16 +73,23 @@ def reciprocal_relu(input_features, alpha_activation):
         torch.Tensor: 应用激活函数后的结果。
     """
 
-    # 检查输入是否包含 NaN 或 inf
-    if torch.any(torch.isnan(input_features)) or torch.any(torch.isinf(input_features)):
-        input_features = torch.clamp(input_features, min=-10.0, max=10.0)
+    # 使用 torch.where 处理 NaN/Inf，避免使用 torch.any 触发同步
+    # 如果输入包含 NaN/Inf，将其替换为安全值（例如 1.0），虽然这可能不是完美的，但能防止崩溃
+    # 更重要的是，我们应该在源头防止 NaN/Inf 的产生
     
-    clipped_input = clip_min_with_gradient_passthrough(input_features + alpha_activation, lower_bound=EPS)
+    # 1. 加上 alpha 参数
+    x = input_features + alpha_activation
+    
+    # 2. 裁剪到 [EPS, inf)
+    # 使用 clip_min_with_gradient_passthrough 保持梯度
+    clipped_input = clip_min_with_gradient_passthrough(x, lower_bound=EPS)
+    
+    # 3. 取倒数
     reciprocal_result = torch.reciprocal(clipped_input)
     
-    # 检查输出是否包含 NaN 或 inf
-    if torch.any(torch.isnan(reciprocal_result)) or torch.any(torch.isinf(reciprocal_result)):
-        reciprocal_result = torch.clamp(reciprocal_result, min=EPS, max=1.0/EPS)
+    # 4. 安全检查（使用 nan_to_num 替代 explicit check）
+    # 将 NaN 替换为 1/EPS，Inf 替换为 1/EPS
+    reciprocal_result = torch.nan_to_num(reciprocal_result, nan=1.0/EPS, posinf=1.0/EPS, neginf=1.0/EPS)
     
     return reciprocal_result
 
@@ -503,7 +510,7 @@ class DCLPArgs:
     """Compile model with torch.compile"""
     compile_mode: str = "reduce-overhead"
     """Compile mode"""
-    weight_decay: float = 0.0
+    weight_decay: float = 0.1
     """Weight decay"""
     use_grad_norm_clipping: bool = False
     """Use gradient norm clipping"""

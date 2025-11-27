@@ -436,7 +436,7 @@ def main():
             if args.disable_bootstrap:
                 bootstrap = (~dones).float()
             else:
-                bootstrap = (truncations & ~dones).float()  #Fixed
+                bootstrap = (truncations | ~dones).float()
 
             clipped_noise = torch.randn_like(actions)
             clipped_noise = clipped_noise.mul(policy_noise).clamp(
