@@ -734,27 +734,15 @@ class FastDCLP:
             qf2_logits = self.actor_critic.q_network_2(q_input)
             
             
-            # qf1_loss = -torch.sum(
-            #     qf1_next_target_dist * F.log_softmax(qf1, dim=1), dim=1
-            # ).mean()
+            qf1_loss = -torch.sum(
+                qf1_next_target_dist * F.log_softmax(qf1_logits, dim=1), dim=1
+            ).mean()
 
-            # qf2_loss = -torch.sum(
-            #     qf2_next_target_dist * F.log_softmax(qf2, dim=1), dim=1
-            # ).mean()
+            qf2_loss = -torch.sum(
+                qf2_next_target_dist * F.log_softmax(qf2_logits, dim=1), dim=1
+            ).mean()
 
-            # Use PyTorch's kl_div for better numerical stability
-            # kl_div expects log-probabilities as input and probabilities as target
-            # reduction='batchmean' averages over batch dimension
-            qf1_loss = F.kl_div(
-                F.log_softmax(qf1_logits, dim=1),
-                qf1_next_target_dist,
-                reduction='batchmean'
-            )
-            qf2_loss = F.kl_div(
-                F.log_softmax(qf2_logits, dim=1),
-                qf2_next_target_dist,
-                reduction='batchmean'
-            )
+
             critic_loss = qf1_loss + qf2_loss
 
         # Update critic
@@ -762,15 +750,13 @@ class FastDCLP:
         self.scalar.scale(critic_loss).backward()
         self.scalar.unscale_(self.critic_optimizer)
 
-        if self.use_grad_norm_clipping:
-            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-                list(self.actor_critic.shared_cnn_dense.parameters()) +
-                list(self.actor_critic.q_network_1.parameters()) +
-                list(self.actor_critic.q_network_2.parameters()),
-                max_norm=self.max_grad_norm
-            )
-        else:
-            critic_grad_norm = torch.tensor(0.0, device=self.device)
+
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+            list(self.actor_critic.shared_cnn_dense.parameters()) +
+            list(self.actor_critic.q_network_1.parameters()) +
+            list(self.actor_critic.q_network_2.parameters()),
+            max_norm=self.max_grad_norm
+        )
             
         self.scalar.step(self.critic_optimizer)
         self.scalar.update()
@@ -800,13 +786,13 @@ class FastDCLP:
             self.scalar.scale(actor_loss).backward()
             self.scalar.unscale_(self.actor_optimizer)
             
-            if self.use_grad_norm_clipping:
-                actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.actor_critic.policy_network.parameters(),
-                    max_norm=self.max_grad_norm
-                )
-            else:
-                actor_grad_norm = torch.zeros((), device=self.device)
+            # if self.use_grad_norm_clipping:
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.actor_critic.policy_network.parameters(),
+                max_norm=self.max_grad_norm
+            )
+            # else:
+            #     actor_grad_norm = torch.zeros((), device=self.device)
 
             self.scalar.step(self.actor_optimizer)
             self.scalar.update()

@@ -22,7 +22,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fast_td3_utils import EmpiricalNormalization
 from environments.isaaclab_env import IsaacLabEnv
-from dclp import DCLP, MLPActorCritic
+from dclp import FastDCLP
 
 
 def parse_args():
@@ -40,6 +40,12 @@ def parse_args():
         type=str,
         required=True,
         help="IsaacLab task name (e.g., Isaac-Navigation-Flat-Turtlebot2-v0)"
+    )
+    parser.add_argument(
+        "--num_envs",
+        type=int,
+        default=16,
+        help="Number of environments to run in parallel"
     )
     parser.add_argument(
         "--device",
@@ -90,7 +96,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_trained_dclp_model(model_path: str, device: str) -> tuple[DCLP, Optional[EmpiricalNormalization], Dict[str, Any]]:
+def load_trained_dclp_model(model_path: str, device: str) -> tuple[FastDCLP, Optional[EmpiricalNormalization], Dict[str, Any]]:
     """
     Load trained DCLP model from checkpoint.
     Args:
@@ -110,32 +116,41 @@ def load_trained_dclp_model(model_path: str, device: str) -> tuple[DCLP, Optiona
 
     # Extract training arguments
     args_dict = checkpoint.get('args', {})
-
-    # Get model state dict
-    model_state_dict = None
-    for key in ['model_state_dict', 'dclp_state_dict', 'state_dict']:
-        if key in checkpoint:
-            model_state_dict = checkpoint[key]
-            break
-
-    model_state_dict = checkpoint['actor_critic']
-
+    
     # Get dimensions from args or use defaults
-    state_dim = args_dict.get('n_obs', 280)  # DCLP typically uses 280 for LiDAR + robot state
+    state_dim = args_dict.get('n_obs', 548)  # DCLP typically uses 280 for LiDAR + robot state
     action_dim = args_dict.get('n_act', 2)   # Typically 2 for navigation (linear, angular velocity)
 
     print(f"Model dimensions - State: {state_dim}, Action: {action_dim}")
 
-    # Create DCLP instance with same parameters as training
-    dclp = DCLP(
+    # Extract FastDCLP specific parameters
+    actor_hidden_dim = args_dict.get('actor_hidden_dim', 256)
+    critic_hidden_dim = args_dict.get('critic_hidden_dim', 256)
+    num_hidden_layers = args_dict.get('num_hidden_layers', 4)
+    
+    actor_hidden_sizes = [actor_hidden_dim for _ in range(num_hidden_layers)]
+    critic_hidden_sizes = [critic_hidden_dim for _ in range(num_hidden_layers)]
+
+    # Create FastDCLP instance with same parameters as training
+    dclp = FastDCLP(
         state_dim=state_dim,
         action_dim=action_dim,
-        lr=args_dict.get('actor_learning_rate', 3e-4),
+        actor_lr=args_dict.get('actor_learning_rate', 3e-4),
+        critic_lr=args_dict.get('critic_learning_rate', 3e-4),
         gamma=args_dict.get('gamma', 0.99),
         tau=args_dict.get('tau', 0.005),
         alpha=args_dict.get('alpha', 0.2),
-        hidden_sizes=tuple(args_dict.get('actor_hidden_dim', [128, 128, 128, 128])),
-        device=device
+        actor_hidden_sizes=actor_hidden_sizes,
+        critic_hidden_sizes=critic_hidden_sizes,
+        num_atoms=args_dict.get('num_atoms', 251),
+        v_min=args_dict.get('v_min', -100.0),
+        v_max=args_dict.get('v_max', 100.0),
+        use_grad_norm_clipping=args_dict.get('use_grad_norm_clipping', True),
+        max_grad_norm=args_dict.get('max_grad_norm', 1.0),
+        device=device,
+        # Default to no AMP/compile for inference/play
+        amp_enabled=False,
+        compile_mode="default"
     )
 
     # Load model state dict
@@ -146,31 +161,11 @@ def load_trained_dclp_model(model_path: str, device: str) -> tuple[DCLP, Optiona
             dclp.load(model_path)
             print("✅ Loaded DCLP model using native load method")
         else:
-            # Try to find actor_critic state dict in training checkpoint
-            if model_state_dict:
-                dclp.actor_critic.load_state_dict(model_state_dict)
-                print("✅ Loaded DCLP model from training checkpoint")
-            else:
-                print("⚠️  Warning: Could not find model state dict, using initialized weights")
+             print("⚠️  Warning: Could not find 'actor_critic' in checkpoint.")
     except Exception as e:
         print(f"⚠️  Warning: Error loading state dict: {e}")
-        print("Trying to load individual components...")
-
-        # Try to load individual network components
-        try:
-            if 'policy_network' in model_state_dict:
-                dclp.actor_critic.policy_network.load_state_dict(
-                    {k[15:]: v for k, v in model_state_dict.items() if k.startswith('policy_network.')}
-                )
-                print("✅ Loaded policy network")
-
-            if 'shared_cnn_dense' in model_state_dict:
-                dclp.actor_critic.shared_cnn_dense.load_state_dict(
-                    {k[17:]: v for k, v in model_state_dict.items() if k.startswith('shared_cnn_dense.')}
-                )
-                print("✅ Loaded shared CNN dense network")
-        except Exception as inner_e:
-            print(f"❌ Failed to load individual components: {inner_e}")
+        import traceback
+        traceback.print_exc()
 
     # Set to evaluation mode
     dclp.actor_critic.eval()
@@ -213,7 +208,7 @@ def create_isaaclab_env(args, render_mode: str = "human") -> IsaacLabEnv:
     env = IsaacLabEnv(
         task_name=args.task_name,
         device=args.device,
-        num_envs=1,  # Single environment for visualization
+        num_envs=args.num_envs,
         seed=args.seed,
         action_bounds=args.action_bounds,
         render_mode=render_mode,
@@ -230,7 +225,7 @@ def create_isaaclab_env(args, render_mode: str = "human") -> IsaacLabEnv:
 
 def play_episode(
     env: IsaacLabEnv,
-    dclp: DCLP,
+    dclp: FastDCLP,
     obs_normalizer: Optional[EmpiricalNormalization],
     episode_num: int,
     max_steps: Optional[int] = None,

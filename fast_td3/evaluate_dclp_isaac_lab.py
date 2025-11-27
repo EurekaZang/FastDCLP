@@ -20,6 +20,7 @@ import wandb
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from torch.amp import autocast, GradScaler
 
 os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -34,7 +35,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from fast_td3_utils import EmpiricalNormalization
 from environments.isaaclab_env import IsaacLabEnv
-from dclp import DCLP
+from dclp import DCLP, FastDCLP
 from dclp_utils import DCLPArgs
 
 torch.set_float32_matmul_precision("high")
@@ -45,7 +46,7 @@ class DCLPEvalArgs(DCLPArgs):
     model_path: str = "models/Isaac-Navigation-Flat-Turtlebot2-v0__dclp_training__42_2800000.pt"
     eval_episodes: int = 5
     max_eval_steps: Optional[int] = None
-    deterministic: bool = True
+    deterministic: bool = False
     out_dir: str = "eval_results"
     exp_name: str = "dclp_evaluation"
 
@@ -84,8 +85,9 @@ def main():
         obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
     else:
         obs_normalizer = torch.nn.Identity()
+    scaler = GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
 
-    dclp = DCLP(
+    dclp = FastDCLP(
         state_dim=n_obs,
         action_dim=n_act,
         actor_lr=args.actor_learning_rate,
@@ -93,10 +95,20 @@ def main():
         gamma=args.gamma,
         tau=args.tau,
         alpha=args.alpha,
-        hidden_sizes=(args.actor_hidden_dim, args.actor_hidden_dim, args.actor_hidden_dim, args.actor_hidden_dim),
+        actor_hidden_sizes=[args.actor_hidden_dim for _ in range(args.num_hidden_layers)],
+        critic_hidden_sizes=[args.critic_hidden_dim for _ in range(args.num_hidden_layers)],
+        num_atoms=args.num_atoms,
+        v_min=args.v_min,
+        v_max=args.v_max,
         use_grad_norm_clipping=args.use_grad_norm_clipping,
         max_grad_norm=args.max_grad_norm,
         device=device,
+        scalar = scaler,
+        amp_enabled=amp_enabled,
+        amp_device_type="cuda",
+        amp_dtype="bf16",
+        compile_mode=args.compile_mode,
+        policy_frequency=args.policy_frequency,
     )
 
     dclp.load(args.model_path)
