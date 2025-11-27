@@ -147,6 +147,8 @@ def main():
         num_atoms=args.num_atoms,
         v_min=args.v_min,
         v_max=args.v_max,
+        std_min=args.std_min,
+        std_max=args.std_max,
         use_grad_norm_clipping=args.use_grad_norm_clipping,
         max_grad_norm=args.max_grad_norm,
         device=device,
@@ -156,6 +158,9 @@ def main():
         amp_dtype=amp_dtype,
         compile_mode=args.compile_mode,
         policy_frequency=args.policy_frequency,
+        policy_noise=args.policy_noise,
+        noise_clip=args.noise_clip,
+        num_envs=args.num_envs,
     )
 
     if args.compile:
@@ -217,7 +222,7 @@ def main():
                     norm_obs = obs_normalizer(obs, update=False)
                 else:
                     norm_obs = obs
-                actions = dclp.get_action(norm_obs)
+                actions = dclp.get_action(norm_obs, deterministic=True)
             
             next_obs, rewards, dones, infos = envs.step(actions.float())
             episode_returns = torch.where(
@@ -284,7 +289,7 @@ def main():
     ema_success_rate = 0.0  # Initialize EMA success rate
 
     obs = envs.reset(random_start_init=False)
-    dones = torch.zeros(args.num_envs, dtype=torch.bool, device=device)
+    dones = None
     pbar = tqdm.tqdm(total=args.total_timesteps, initial=global_step)
     start_time = None
     start_time = time.time()
@@ -301,7 +306,7 @@ def main():
                     norm_obs = normalize_obs(obs, update=False)
                 else:
                     norm_obs = obs
-                actions = dclp.get_action(norm_obs)
+                actions = dclp.get_action(norm_obs, deterministic=False)
 
         next_obs, rewards, dones, infos = envs.step(actions)
         truncations = infos["time_outs"]
