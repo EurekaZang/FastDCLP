@@ -161,6 +161,7 @@ def main():
         policy_noise=args.policy_noise,
         noise_clip=args.noise_clip,
         num_envs=args.num_envs,
+        weight_decay=args.weight_decay,
     )
 
     if args.compile:
@@ -306,8 +307,8 @@ def main():
                     norm_obs = normalize_obs(obs, update=False)
                 else:
                     norm_obs = obs
-                actions = dclp.get_action(norm_obs, deterministic=False)
-
+                actions = dclp.actor_critic.policy_network.explore(norm_obs, dones=dones, deterministic=False)
+        
         next_obs, rewards, dones, infos = envs.step(actions)
         truncations = infos["time_outs"]
         successes = infos["successes"]
@@ -388,24 +389,40 @@ def main():
                     do_actor_update = (global_step % args.policy_frequency == 0)
                 
                 # Train DCLP 并获取指标
-                result = dclp.train_step(data, do_actor_update)
+                dclp.critic_optimizer.zero_grad(set_to_none=True)
+                dclp.actor_optimizer.zero_grad(set_to_none=True)
+
+                result = dclp.compute_gradients(data, do_actor_update)
                 # Unpack tuple and extract scalars immediately
-                actor_loss, critic_loss, actor_grad_norm, critic_grad_norm, qf1, qf2, min_qf_next_target_value, qf_next_target_dist, policy_qf_value, log_probs = result
+                actor_loss, critic_loss, qf1, qf2, min_qf_next_target_value, qf_next_target_dist, policy_qf_value, log_probs = result
                 
-                # Create logs dict with extracted values
-                # Note: actor values will be zero when actor is not updated
-                logs_dict = {
-                    'actor_loss': actor_loss.detach(),
-                    'qf_loss': critic_loss.detach(),
-                    'actor_grad_norm': actor_grad_norm.detach(),
-                    'critic_grad_norm': critic_grad_norm.detach(),
-                    'qf_max': min_qf_next_target_value.max().detach(),
-                    'qf_min': min_qf_next_target_value.min().detach(),
-                    'q_next_dist_numpy': qf_next_target_dist.mean(dim=0).detach().cpu().numpy(),
-                    'q_dist_entropy': -(qf_next_target_dist.mean(dim=0) * torch.log(qf_next_target_dist.mean(dim=0) + 1e-8)).sum().item(),
-                    'policy_q_mean': policy_qf_value.mean().detach(),
-                    'log_probs_mean': log_probs.mean().detach(),
-                }
+                # Critic Step
+                dclp.scalar.unscale_(dclp.critic_optimizer)
+                critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    list(dclp.actor_critic.shared_cnn_dense.parameters()) +
+                    list(dclp.actor_critic.q_network_1.parameters()) +
+                    list(dclp.actor_critic.q_network_2.parameters()),
+                    max_norm=dclp.max_grad_norm
+                )
+                dclp.scalar.step(dclp.critic_optimizer)
+                # dclp.scalar.update() # Moved to end
+
+                # Actor Step
+                if do_actor_update:
+                    dclp.scalar.unscale_(dclp.actor_optimizer)
+                    actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        dclp.actor_critic.policy_network.parameters(),
+                        max_norm=dclp.max_grad_norm
+                    )
+                    dclp.scalar.step(dclp.actor_optimizer)
+                    # dclp.scalar.update() # Moved to end
+                else:
+                    actor_grad_norm = torch.tensor(0.0, device=device)
+                
+                # Update scalar once per step
+                dclp.scalar.update()
+                    
+                dclp.update_target_network()
             
             # Update learning rate schedulers after optimizer steps
             q_scheduler.step()
@@ -413,6 +430,10 @@ def main():
             
             # --- 新增: 每 100 步记录一次日志 ---
             if global_step % args.log_interval == 0 and args.use_wandb:
+                # Extract logging values only when needed to avoid CPU sync
+                q_next_dist_numpy = qf_next_target_dist.mean(dim=0).detach().cpu().numpy()
+                q_dist_entropy = -(qf_next_target_dist.mean(dim=0) * torch.log(qf_next_target_dist.mean(dim=0) + 1e-8)).sum().item()
+                
                 elapsed_time = time.time() - start_time
                 speed = global_step / elapsed_time if elapsed_time > 0 else 0
                 with torch.no_grad():
@@ -424,17 +445,17 @@ def main():
                         "Training/critic_lr": q_scheduler.get_last_lr()[0],
                         "Training/actor_lr": actor_scheduler.get_last_lr()[0],
                         "Training/env_rewards": rewards.mean(),
-                        "Training/actor_loss": logs_dict.get('actor_loss'),
-                        "Training/qf_loss": logs_dict.get('qf_loss'),
-                        "Training/actor_grad_norm": logs_dict.get('actor_grad_norm'),
-                        "Training/critic_grad_norm": logs_dict.get('critic_grad_norm'),
+                        "Training/actor_loss": actor_loss.detach(),
+                        "Training/qf_loss": critic_loss.detach(),
+                        "Training/actor_grad_norm": actor_grad_norm.detach(),
+                        "Training/critic_grad_norm": critic_grad_norm.detach(),
                         "Training/buffer_rewards": raw_rewards.mean(),
-                        "Training/qf_max": logs_dict.get('qf_max'),
-                        "Training/qf_min": logs_dict.get('qf_min'),
-                        "Training/q_dist_entropy": logs_dict.get('q_dist_entropy'),
-                        "Training/q_dist_hist": wandb.Histogram(logs_dict.get('q_next_dist_numpy')) if logs_dict.get('q_next_dist_numpy') is not None else None,
-                        "Training/policy_q_mean": logs_dict.get('policy_q_mean'),
-                        "Training/log_probs_mean": logs_dict.get('log_probs_mean'),
+                        "Training/qf_max": min_qf_next_target_value.max().detach(),
+                        "Training/qf_min": min_qf_next_target_value.min().detach(),
+                        "Training/q_dist_entropy": q_dist_entropy,
+                        "Training/q_dist_hist": wandb.Histogram(q_next_dist_numpy),
+                        "Training/policy_q_mean": policy_qf_value.mean().detach(),
+                        "Training/log_probs_mean": log_probs.mean().detach(),
                         
                         # --- 动作日志 ---
                         "Training/env0_linear_action": actions[0][0] * 10,
@@ -443,6 +464,7 @@ def main():
 
                 # 过滤掉 None 值
                 wandb_logs = {k: v for k, v in wandb_logs.items() if v is not None}
+                wandb_logs.update(infos["infos"])
                 if args.use_wandb:
                     wandb.log(wandb_logs, step=global_step)
 

@@ -473,7 +473,7 @@ class DCLPArgs:
     """Number of updates per step"""
     std_min: float = 0.01
     """Minimum standard deviation for policy"""
-    std_max: float = 0.8
+    std_max: float = 0.5
     """Maximum standard deviation for policy"""
 
     # Distributional Critic 
@@ -507,7 +507,7 @@ class DCLPArgs:
     """Compile model with torch.compile"""
     compile_mode: str = "reduce-overhead"
     """Compile mode"""
-    weight_decay: float = 0.1
+    weight_decay: float = 1e-3
     """Weight decay"""
     use_grad_norm_clipping: bool = False
     """Use gradient norm clipping"""
