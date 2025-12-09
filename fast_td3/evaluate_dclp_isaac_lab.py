@@ -133,7 +133,7 @@ def main():
         ep_success = False
         rewards_trace = []
         actions_trace = {"linear": [], "angular": []}
-        max_steps = args.max_eval_steps if args.max_eval_steps is not None else min(1000, envs.max_episode_steps)
+        max_steps = args.max_eval_steps if args.max_eval_steps is not None else envs.max_episode_steps
         with torch.no_grad():
             for step in range(max_steps):
                 if args.obs_normalization:
@@ -141,6 +141,7 @@ def main():
                 else:
                     norm_obs = obs
                 actions = dclp.get_action(norm_obs, deterministic=args.deterministic)
+                print("actions",actions)
                 obs, reward, done, info = envs.step(actions)
                 r = reward.mean().item()
                 ep_return += r
