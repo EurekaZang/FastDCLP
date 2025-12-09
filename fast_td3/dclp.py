@@ -703,7 +703,7 @@ class FastDCLP:
         print("[FastDCLP] First step will be slow (~30s), then much faster!")
         
         # Compile with fullgraph for better optimization
-        self.compute_gradients = torch.compile(self.compute_gradients, mode=mode, fullgraph=False)
+        self.train_step = torch.compile(self.train_step, mode=mode, fullgraph=False)
         self.update_target_network = torch.compile(self.update_target_network, mode=mode, fullgraph=False)
         self._is_compiled = True
         print("[FastDCLP] ✓ Compilation complete!")
@@ -738,9 +738,9 @@ class FastDCLP:
         #                              self.actor_critic.parameters()):
         #     target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
-    def compute_gradients(self, data, do_actor_update: bool):
+    def train_step(self, data, do_actor_update: bool):
         """
-        Compute gradients for actor and critic
+        Single training step
         Args:
             data: Dictionary containing 'state', 'action', 'reward', 'next_state', 'done'
             do_actor_update: Boolean flag indicating whether to update the actor this step
@@ -804,20 +804,20 @@ class FastDCLP:
             critic_loss = qf1_loss + qf2_loss
 
         # Update critic
-        # self.critic_optimizer.zero_grad(set_to_none=True) # Moved to outer loop
+        self.critic_optimizer.zero_grad(set_to_none=True)
         self.scalar.scale(critic_loss).backward()
-        # self.scalar.unscale_(self.critic_optimizer) # Moved to outer loop
+        self.scalar.unscale_(self.critic_optimizer)
 
 
-        # critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-        #     list(self.actor_critic.shared_cnn_dense.parameters()) +
-        #     list(self.actor_critic.q_network_1.parameters()) +
-        #     list(self.actor_critic.q_network_2.parameters()),
-        #     max_norm=self.max_grad_norm
-        # )
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+            list(self.actor_critic.shared_cnn_dense.parameters()) +
+            list(self.actor_critic.q_network_1.parameters()) +
+            list(self.actor_critic.q_network_2.parameters()),
+            max_norm=self.max_grad_norm
+        )
             
-        # self.scalar.step(self.critic_optimizer) # Moved to outer loop
-        # self.scalar.update() # Moved to outer loop
+        self.scalar.step(self.critic_optimizer)
+        self.scalar.update()
 
         # Freeze Q-networks
         for param in self.actor_critic.q_network_1.parameters():
@@ -840,26 +840,25 @@ class FastDCLP:
                 actor_loss = - policy_qf_value.mean()# (self.alpha * log_probs - policy_qf_value).mean()
 
             # Update actor
-            # Update actor
-            # self.actor_optimizer.zero_grad(set_to_none=True) # Moved to outer loop
+            self.actor_optimizer.zero_grad(set_to_none=True)
             self.scalar.scale(actor_loss).backward()
-            # self.scalar.unscale_(self.actor_optimizer) # Moved to outer loop
+            self.scalar.unscale_(self.actor_optimizer)
             
             # if self.use_grad_norm_clipping:
-            # actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-            #     self.actor_critic.policy_network.parameters(),
-            #     max_norm=self.max_grad_norm
-            # )
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.actor_critic.policy_network.parameters(),
+                max_norm=self.max_grad_norm
+            )
             # else:
             #     actor_grad_norm = torch.zeros((), device=self.device)
 
-            # self.scalar.step(self.actor_optimizer) # Moved to outer loop
-            # self.scalar.update() # Moved to outer loop
+            self.scalar.step(self.actor_optimizer)
+            self.scalar.update()
         else:
             # Actor not updated this step - use zero tensors to avoid graph breaks
             # Using None would cause torch.compile to recompile
             actor_loss = torch.zeros((), device=self.device)
-            # actor_grad_norm = torch.zeros((), device=self.device) # Removed
+            actor_grad_norm = torch.zeros((), device=self.device)
             policy_qf_value = torch.zeros(critic_states.shape[0], device=self.device)
             log_probs = torch.zeros(critic_states.shape[0], device=self.device)
         
@@ -873,14 +872,14 @@ class FastDCLP:
             param.requires_grad = True
 
         # Update target network
-        # self.update_target_network(tau=self.tau) # Moved to outer loop
+        self.update_target_network(tau=self.tau)
 
         # Return simple dict to avoid recompilation - extract scalars outside
         return (
             actor_loss,
             critic_loss,
-            # actor_grad_norm, # Removed
-            # critic_grad_norm, # Removed
+            actor_grad_norm,
+            critic_grad_norm,
             qf1_logits,
             qf2_logits,
             torch.minimum(qf1_next_target_value, qf2_next_target_value),
