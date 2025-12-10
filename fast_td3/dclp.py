@@ -95,8 +95,15 @@ class MLPGaussianPolicy(nn.Module):
         constrained_log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (constrained_log_std + 1)
         component_std_devs = torch.exp(constrained_log_std)
         # 采样高斯组件
-        # print(f"dclp.py:97  log_mixture_weights shape={log_mixture_weights.shape}  min={log_mixture_weights.min().item():.4f}  max={log_mixture_weights.max().item():.4f}  mean={log_mixture_weights.mean().item():.4f}  has_nan={torch.isnan(log_mixture_weights).any().item()}  has_inf={torch.isinf(log_mixture_weights).any().item()}")
-        selected_component_idx = torch.multinomial(torch.softmax(log_mixture_weights, dim=-1), num_samples=1)  # 选择组件
+        # Ensure mixture weights are numerically stable before softmax
+        log_mixture_weights = torch.clamp(log_mixture_weights, min=-20.0, max=20.0)
+        mixture_probs = torch.softmax(log_mixture_weights, dim=-1)
+        # Guard against NaN/inf in mixture probabilities
+        mixture_probs = torch.nan_to_num(mixture_probs, nan=1.0/self.num_mixture_components, posinf=1.0, neginf=0.0)
+        # Ensure probabilities sum to 1
+        mixture_probs = mixture_probs / (mixture_probs.sum(dim=-1, keepdim=True) + EPS)
+        
+        selected_component_idx = torch.multinomial(mixture_probs, num_samples=1)  # 选择组件
         # 获取选中组件的参数
         # batch_indices = torch.arange(batch_size, device=state_input.device)
         # selected_component_mean = component_means[batch_indices, selected_component_idx.squeeze(-1)]      # 选中组件均值
@@ -156,11 +163,18 @@ class MLPGaussianExploPolicy(MLPGaussianPolicy):
 
         act_mean, act, log_action_prob = self(obs)
         act_mean, act, _ = apply_squashing_func(act_mean, act, log_action_prob)
+        
+        # Guard against NaN/inf in actions
+        act_mean = torch.nan_to_num(act_mean, nan=0.0, posinf=1.0, neginf=-1.0)
+        act = torch.nan_to_num(act, nan=0.0, posinf=1.0, neginf=-1.0)
+        
         if deterministic:
-            return act_mean
+            return torch.clamp(act_mean, -1.0, 1.0)
 
         noise = torch.randn_like(act) * self.noise_scales
-        return act + noise
+        noisy_action = act + noise
+        # Clamp to valid action space to prevent CUDA assertion failures
+        return torch.clamp(noisy_action, -1.0, 1.0)
 
 
 class MLPActorCritic(nn.Module):

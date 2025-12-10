@@ -109,7 +109,7 @@ def main():
         amp_dtype="bf16",
         compile_mode=args.compile_mode,
         policy_frequency=args.policy_frequency,
-        num_envs=args.num_envs,
+        num_envs=512,
     )
 
     dclp.load(args.model_path)
