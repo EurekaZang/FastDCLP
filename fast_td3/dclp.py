@@ -95,15 +95,8 @@ class MLPGaussianPolicy(nn.Module):
         constrained_log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (constrained_log_std + 1)
         component_std_devs = torch.exp(constrained_log_std)
         # 采样高斯组件
-        # Ensure mixture weights are numerically stable before softmax
-        log_mixture_weights = torch.clamp(log_mixture_weights, min=-20.0, max=20.0)
-        mixture_probs = torch.softmax(log_mixture_weights, dim=-1)
-        # Guard against NaN/inf in mixture probabilities
-        mixture_probs = torch.nan_to_num(mixture_probs, nan=1.0/self.num_mixture_components, posinf=1.0, neginf=0.0)
-        # Ensure probabilities sum to 1
-        mixture_probs = mixture_probs / (mixture_probs.sum(dim=-1, keepdim=True) + EPS)
-        
-        selected_component_idx = torch.multinomial(mixture_probs, num_samples=1)  # 选择组件
+        selected_component_idx = torch.multinomial(torch.softmax(log_mixture_weights, dim=-1), num_samples=1)  # 选择组件
+
         # 获取选中组件的参数
         # batch_indices = torch.arange(batch_size, device=state_input.device)
         # selected_component_mean = component_means[batch_indices, selected_component_idx.squeeze(-1)]      # 选中组件均值
@@ -131,7 +124,7 @@ class MLPGaussianPolicy(nn.Module):
         log_probability = torch.nan_to_num(log_probability, nan=0.0, posinf=1e6, neginf=-1e6)
         return selected_component_mean, sampled_action, log_probability
 
-class MLPGaussianExploPolicy(MLPGaussianPolicy):
+class MLPGaussianTD3ExploPolicy(MLPGaussianPolicy):
     def __init__(self, state_dim, action_dim, hidden_sizes=(128, 128, 128, 128), activation=F.leaky_relu, output_activation=F.leaky_relu, std_min=0.05, std_max=0.8, num_envs=256, device="cuda"):
         super().__init__(state_dim, action_dim, hidden_sizes, activation, output_activation)
         self.n_envs = num_envs
@@ -175,6 +168,23 @@ class MLPGaussianExploPolicy(MLPGaussianPolicy):
         noisy_action = act + noise
         # Clamp to valid action space to prevent CUDA assertion failures
         return torch.clamp(noisy_action, -1.0, 1.0)
+
+
+class MLPGaussianSACExploPolicy(MLPGaussianPolicy):
+    def __init__(self, state_dim, action_dim, hidden_sizes=(128, 128, 128, 128), activation=F.leaky_relu, output_activation=F.leaky_relu, device="cuda"):
+        super().__init__(state_dim, action_dim, hidden_sizes, activation, output_activation)
+
+    @torch.no_grad()
+    def explore(
+        self, obs: torch.Tensor, deterministic: bool = False
+    ) -> torch.Tensor:
+        act_mean, act, log_action_prob = self(obs)
+        act_mean, act, _ = apply_squashing_func(act_mean, act, log_action_prob)
+
+        if deterministic:
+            return act_mean
+
+        return act
 
 
 class MLPActorCritic(nn.Module):
@@ -319,15 +329,15 @@ class MLPActorDistCritic(nn.Module):
         self.hidden_activation = activation
 
         # ============= Actor网络(策略网络) =============
-        self.policy_network = MLPGaussianExploPolicy(
+        self.policy_network = MLPGaussianSACExploPolicy(
             state_dim,
             action_dim,
             actor_hidden_sizes,
             activation,
             output_activation,
-            std_min,
-            std_max,
-            num_envs,
+            # std_min, #FastTD3
+            # std_max,
+            # num_envs,
             device,
             )
 
@@ -351,11 +361,19 @@ class MLPActorDistCritic(nn.Module):
         for layer in self.q_network_1.layer_modules:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight)
-                nn.init.constant_(layer.bias, 0.1)
+                nn.init.constant_(layer.bias, 0.0)
         for layer in self.q_network_2.layer_modules:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight)
                 nn.init.constant_(layer.bias, 0.1)
+        for layer in self.policy_network.mlp_network.layer_modules:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.constant_(layer.bias, 0.0)
+        nn.init.xavier_uniform_(self.policy_network.gmm_output_layer.weight)
+        nn.init.constant_(self.policy_network.gmm_output_layer.bias, 0.0)
+
+            
 
     def forward(self, state_input, action_input=None):
         """
@@ -416,21 +434,14 @@ class MLPActorDistCritic(nn.Module):
         # Get actions from policy network and apply squashing
         action_mean, sampled_action, log_action_prob = self.policy_network(state)
         _, squashed_action, adjusted_log_prob = apply_squashing_func(action_mean, sampled_action, log_action_prob)
-        policy_noise = torch.randn_like(squashed_action)
-        policy_noise = policy_noise.mul(policy_noise).clamp(
-            -noise_clip, noise_clip
-        )
-        next_squashed_actions = (squashed_action + policy_noise).clamp(
-            -1.0, 1.0
-        )
+        
         # Extract CNN features from state
         extracted_features = self.shared_cnn_dense(state)
         
         q1_proj = self.q_network_1.projection(
             extracted_features,
-            next_squashed_actions,
-            rewards,
-            # rewards - alpha * adjusted_log_prob,
+            squashed_action,
+            rewards - discount * bootstrap * alpha * adjusted_log_prob,
             bootstrap,
             discount,
             self.q_support,
@@ -438,9 +449,8 @@ class MLPActorDistCritic(nn.Module):
         )
         q2_proj = self.q_network_2.projection(
             extracted_features,
-            next_squashed_actions,
-            rewards,
-            # rewards - alpha * adjusted_log_prob,
+            squashed_action,
+            rewards - discount * bootstrap * alpha * adjusted_log_prob,
             bootstrap,
             discount,
             self.q_support,
@@ -540,6 +550,7 @@ class DCLP:
             target_q = torch.min(target_q1, target_q2) - self.alpha * next_log_probs
             target_q = rewards + (~dones) * self.gamma * target_q
             # target_q = rewards + self.gamma * target_q
+
         # Current Q-values
         _, _, _, current_q1, current_q2, _, _ = self.actor_critic(states, actions)
         # Critic loss
@@ -851,7 +862,7 @@ class FastDCLP:
                 policy_qf2_value = self.actor_critic.get_value(F.softmax(policy_q2, dim=1))
                 policy_qf_value = torch.minimum(policy_qf1_value, policy_qf2_value)
                 
-                actor_loss = - policy_qf_value.mean()# (self.alpha * log_probs - policy_qf_value).mean()
+                actor_loss = (self.alpha * log_probs - policy_qf_value).mean() #SAC
 
             # Update actor
             self.actor_optimizer.zero_grad(set_to_none=True)

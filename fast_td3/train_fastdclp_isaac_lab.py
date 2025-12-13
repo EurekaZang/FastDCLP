@@ -307,7 +307,8 @@ def main():
                     norm_obs = normalize_obs(obs, update=False)
                 else:
                     norm_obs = obs
-                actions = dclp.actor_critic.policy_network.explore(norm_obs, dones=dones, deterministic=False)
+                actions = dclp.actor_critic.policy_network.explore(norm_obs, deterministic=False)
+                # actions = dclp.get_action(norm_obs, deterministic=False)
         
         next_obs, rewards, dones, infos = envs.step(actions)
         truncations = infos["time_outs"]
