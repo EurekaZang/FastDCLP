@@ -10,7 +10,7 @@ from dclp_utils import CNNNet, CNNDense, MLP
 from torch.amp import autocast
 
 EPS = 1e-8
-LOG_STD_MAX = 2
+LOG_STD_MAX = 0.5
 LOG_STD_MIN = -20
 
 
